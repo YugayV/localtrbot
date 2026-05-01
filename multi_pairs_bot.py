@@ -6,6 +6,7 @@ Notifications: Trade alerts + Hourly reports
 """
 
 import telebot
+from telebot.apihelper import ApiTelegramException
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -40,6 +41,9 @@ load_env(os.path.join(BASE_DIR, ".env"))
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")
+
+WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "").strip()
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
 if not BOT_TOKEN or not ADMIN_ID:
     raise RuntimeError("Missing BOT_TOKEN or ADMIN_ID in .env")
@@ -931,6 +935,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
+        if TELEGRAM_WEBHOOK_SECRET and self.path == f"/telegram/{TELEGRAM_WEBHOOK_SECRET}":
+            try:
+                n = int(self.headers.get("Content-Length", "0") or 0)
+                raw = self.rfile.read(n)
+                payload = json.loads(raw.decode("utf-8") or "{}")
+                update = telebot.types.Update.de_json(payload)
+                if update is not None:
+                    bot.process_new_updates([update])
+                self._send_json(200, {"ok": True})
+            except Exception as e:
+                self._send_json(400, {"ok": False, "error": str(e)})
+            return
+
         if self.path != "/api/config":
             self._send_json(404, {"ok": False, "error": "not found"})
             return
@@ -1238,9 +1255,27 @@ def auto_trade():
 
 def run_bot_polling():
     try:
-        bot.polling(none_stop=True)
+        bot.remove_webhook()
     except:
         pass
+
+    backoff = 5
+    while True:
+        try:
+            bot.polling(none_stop=True)
+            backoff = 5
+        except ApiTelegramException as e:
+            if getattr(e, "error_code", None) == 409:
+                print("Telegram 409 Conflict: another getUpdates is running for this bot token. Ensure only one polling instance is running or enable webhook mode.")
+                time.sleep(15)
+                continue
+            print(f"Telegram API error: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+        except Exception as e:
+            print(f"Polling error: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
 
 
 def run_http_server():
@@ -1269,8 +1304,18 @@ def main():
     t1 = threading.Thread(target=auto_trade, daemon=True)
     t1.start()
 
-    t2 = threading.Thread(target=run_bot_polling, daemon=True)
-    t2.start()
+    if WEBHOOK_BASE_URL and TELEGRAM_WEBHOOK_SECRET:
+        try:
+            bot.remove_webhook()
+            time.sleep(1)
+            url = WEBHOOK_BASE_URL.rstrip("/") + f"/telegram/{TELEGRAM_WEBHOOK_SECRET}"
+            ok = bot.set_webhook(url=url)
+            print(f"Telegram webhook: {'OK' if ok else 'FAILED'} -> {url}")
+        except Exception as e:
+            print(f"Webhook setup error: {e}")
+    else:
+        t2 = threading.Thread(target=run_bot_polling, daemon=True)
+        t2.start()
 
     run_http_server()
 
