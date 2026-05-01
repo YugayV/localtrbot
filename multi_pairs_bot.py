@@ -117,7 +117,7 @@ PAIRS = {
     "LINKUSD": "LINK-USD",
     "DOTUSD": "DOT-USD",
     "LTCUSD": "LTC-USD",
-    "MATICUSD": "POL-USD",
+    "MATICUSD": ["MATIC-USD", "POL-USD"],
 
     "USDJPY": "USDJPY=X",  # 40% WR, +$141
     "EURJPY": "EURJPY=X",  # 37% WR, +$96
@@ -185,7 +185,7 @@ _DATA_CACHE_LOCK = threading.Lock()
 
 def get_data(ticker, period="5d", interval="15m"):
     now = time.time()
-    key = f"{ticker}|{period}|{interval}"
+    tickers = list(ticker) if isinstance(ticker, (list, tuple, set)) else [ticker]
 
     ttl = 120
     if interval in ["1h", "60m"]:
@@ -193,27 +193,36 @@ def get_data(ticker, period="5d", interval="15m"):
     if interval in ["15m", "30m"]:
         ttl = 120
 
-    with _DATA_CACHE_LOCK:
-        hit = _DATA_CACHE.get(key)
-        if hit and (now - hit.get("ts", 0)) < ttl:
-            return hit.get("df")
+    fail_ttl = 600
 
-    try:
-        t = yf.Ticker(ticker)
-        d = t.history(period=period, interval=interval)
-        if d is None or d.empty or len(d) < 20:
-            raise ValueError("no data")
+    for tk in tickers:
+        key = f"{tk}|{period}|{interval}"
 
-        with _DATA_CACHE_LOCK:
-            _DATA_CACHE[key] = {"ts": now, "df": d}
-
-        return d
-    except:
         with _DATA_CACHE_LOCK:
             hit = _DATA_CACHE.get(key)
-            if hit:
+            if hit and hit.get("df") is not None and (now - hit.get("ts", 0)) < ttl:
                 return hit.get("df")
-        return None
+            if hit and hit.get("df") is None and (now - hit.get("fail_ts", 0)) < fail_ttl:
+                continue
+
+        try:
+            t = yf.Ticker(tk)
+            d = t.history(period=period, interval=interval)
+            if d is None or d.empty or len(d) < 20:
+                raise ValueError("no data")
+
+            with _DATA_CACHE_LOCK:
+                _DATA_CACHE[key] = {"ts": now, "df": d}
+
+            return d
+        except:
+            with _DATA_CACHE_LOCK:
+                prev = _DATA_CACHE.get(key)
+                if prev and prev.get("df") is not None:
+                    return prev.get("df")
+                _DATA_CACHE[key] = {"fail_ts": now, "df": None}
+
+    return None
 
 def get_indicators(data, pair_name):
     closes = data['Close'].values
