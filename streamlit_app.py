@@ -4,7 +4,7 @@ import time
 
 import pandas as pd
 import plotly.graph_objects as go
-import streamlit_app as st
+import streamlit as st
 
 import multi_pairs_bot as botmod
 
