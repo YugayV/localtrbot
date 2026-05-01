@@ -15,6 +15,7 @@ import threading
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -356,12 +357,13 @@ DASHBOARD_HTML = """<!doctype html>
   <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
   <title>LocalTRBot Dashboard</title>
   <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>
+  <script src=\"https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js\"></script>
   <style>
     body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1100px}
     .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
     .card{border:1px solid #ddd;border-radius:10px;padding:14px}
     label{display:block;margin:10px 0 4px;font-size:13px;color:#333}
-    input{width:100%;padding:8px;border:1px solid #ccc;border-radius:8px}
+    input,select{width:100%;padding:8px;border:1px solid #ccc;border-radius:8px}
     button{padding:10px 12px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}
     .row{display:flex;gap:10px}
     .row>div{flex:1}
@@ -425,8 +427,108 @@ DASHBOARD_HTML = """<!doctype html>
     <div class=\"card\"><h3>Win/Loss</h3><canvas id=\"wl\"></canvas></div>
   </div>
 
+  <div class=\"grid\" style=\"margin-top:16px\">
+    <div class=\"card\" style=\"grid-column:1 / -1\">
+      <h3>Wave Analysis (10Y) + Entry Signals</h3>
+      <div class=\"row\">
+        <div>
+          <label>Pair</label>
+          <select id=\"pair_select\"></select>
+        </div>
+        <div>
+          <label>Signal</label>
+          <div class=\"muted\" id=\"signal_box\">Loading...</div>
+        </div>
+      </div>
+      <div id=\"wavechart\" style=\"height:420px;margin-top:10px\"></div>
+      <div class=\"muted\" id=\"wave_meta\" style=\"margin-top:8px\"></div>
+    </div>
+  </div>
+
 <script>
 let equityChart, wlChart;
+let tvChart, candleSeries, waveSeries;
+let historyLoadedOnce = false;
+
+function setText(id, t){
+  const el = document.getElementById(id);
+  if (el) el.textContent = t;
+}
+
+function ensurePairs(pairs){
+  const sel = document.getElementById('pair_select');
+  if (!sel || !Array.isArray(pairs)) return;
+  if (sel.options.length) return;
+
+  for (const p of pairs){
+    const opt = document.createElement('option');
+    opt.value = p;
+    opt.textContent = p;
+    sel.appendChild(opt);
+  }
+
+  sel.addEventListener('change', () => loadHistory(sel.value));
+}
+
+function ensureWaveChart(){
+  if (tvChart) return;
+  const container = document.getElementById('wavechart');
+  if (!container || !window.LightweightCharts) return;
+
+  tvChart = LightweightCharts.createChart(container, {
+    layout: { background: { type: 'solid', color: '#ffffff' }, textColor: '#111111' },
+    grid: { vertLines: { color: '#eeeeee' }, horzLines: { color: '#eeeeee' } },
+    rightPriceScale: { borderVisible: false },
+    timeScale: { borderVisible: false },
+  });
+
+  candleSeries = tvChart.addCandlestickSeries({
+    upColor: '#1a7f37', downColor: '#d1242f',
+    wickUpColor: '#1a7f37', wickDownColor: '#d1242f',
+    borderVisible: false,
+  });
+
+  waveSeries = tvChart.addLineSeries({ color: '#111111', lineWidth: 2 });
+}
+
+async function loadHistory(pair){
+  if (!pair) return;
+  setText('signal_box', 'Loading...');
+  setText('wave_meta', '');
+
+  const res = await fetch('/api/history?pair=' + encodeURIComponent(pair));
+  const data = await res.json();
+  if (data && data.ok === false) throw new Error(data.error || 'history error');
+
+  ensureWaveChart();
+  if (!tvChart) return;
+
+  const candles = Array.isArray(data.candles) ? data.candles : [];
+  candleSeries.setData(candles);
+
+  const swings = Array.isArray(data.swings) ? data.swings : [];
+  waveSeries.setData(swings.map(p => ({ time: p.time, value: p.price })));
+  candleSeries.setMarkers(swings.map(p => ({
+    time: p.time,
+    position: (p.kind === 'H') ? 'aboveBar' : 'belowBar',
+    color: '#111111',
+    shape: (p.kind === 'H') ? 'arrowDown' : 'arrowUp',
+    text: p.label || '',
+  })));
+
+  let sigTxt = 'No signal';
+  if (data.signal === 1) sigTxt = 'BUY signal';
+  if (data.signal === -1) sigTxt = 'SELL signal';
+  const reasons = Array.isArray(data.signal_reasons) ? data.signal_reasons : [];
+  if (reasons.length) sigTxt += ' • ' + reasons.join(', ');
+  setText('signal_box', sigTxt);
+
+  const last = data.last || {};
+  const meta = `Pair ${data.pair || pair} • Bars ${candles.length} • RSI ${Number(last.rsi).toFixed(1)} • Price ${Number(last.price).toFixed(5)}`;
+  setText('wave_meta', meta);
+
+  tvChart.timeScale().fitContent();
+}
 
 async function loadAll(){
   const st = await fetch('/api/state').then(r=>r.json());
@@ -434,6 +536,15 @@ async function loadAll(){
 
   for (const k of ['risk_per_trade','trades_per_pair','sl_pips','tp_pips','leverage','check_interval','auto_trade_enabled']){
     document.getElementById(k).value = st.config[k];
+  }
+
+  ensurePairs(st.pairs || []);
+
+  const sel = document.getElementById('pair_select');
+  if (sel && !sel.value && sel.options.length) sel.value = sel.options[0].value;
+  if (sel && sel.value && !historyLoadedOnce){
+    historyLoadedOnce = true;
+    loadHistory(sel.value).catch(e => setText('signal_box', 'Error: ' + (e?.message || String(e))));
   }
 
   const eq = await fetch('/api/equity').then(r=>r.json());
@@ -496,6 +607,139 @@ def build_pair_stats(trades):
     for pair, s in out.items():
         s["wr"] = (s["wins"] / s["trades"] * 100.0) if s["trades"] else 0.0
     return out
+
+
+_HISTORY_CACHE = {}
+_HISTORY_CACHE_LOCK = threading.Lock()
+
+
+def _pair_is_crypto(pair):
+    return pair in ["BTCUSD", "ETHUSD"]
+
+
+def _history_threshold(pair):
+    return 0.04 if _pair_is_crypto(pair) else 0.015
+
+
+def _df_to_candles(df):
+    out = []
+    if df is None or df.empty:
+        return out
+
+    idx = df.index
+    for i in range(len(df)):
+        ts = idx[i]
+        if isinstance(ts, pd.Timestamp):
+            ts = ts.to_pydatetime()
+        t = int(ts.replace(tzinfo=timezone.utc).timestamp())
+        out.append(
+            {
+                "time": t,
+                "open": float(df["Open"].iloc[i]),
+                "high": float(df["High"].iloc[i]),
+                "low": float(df["Low"].iloc[i]),
+                "close": float(df["Close"].iloc[i]),
+                "volume": float(df["Volume"].iloc[i]) if "Volume" in df.columns else 0.0,
+            }
+        )
+    return out
+
+
+def _zigzag_swings(candles, threshold):
+    if not candles:
+        return []
+
+    prices = [c["close"] for c in candles]
+    times = [c["time"] for c in candles]
+
+    direction = 0
+    last_pivot_i = 0
+    extreme_i = 0
+    extreme_p = prices[0]
+    pivots = []
+
+    for i in range(1, len(prices)):
+        p = prices[i]
+        base = prices[last_pivot_i] if prices[last_pivot_i] else 1e-9
+        chg = (p - prices[last_pivot_i]) / base
+
+        if direction == 0:
+            if abs(chg) >= threshold:
+                direction = 1 if chg > 0 else -1
+                extreme_i = i
+                extreme_p = p
+            continue
+
+        if direction == 1:
+            if p >= extreme_p:
+                extreme_i = i
+                extreme_p = p
+                continue
+            if (extreme_p - p) / (extreme_p if extreme_p else 1e-9) >= threshold:
+                pivots.append({"time": times[extreme_i], "price": float(extreme_p), "kind": "H"})
+                last_pivot_i = extreme_i
+                direction = -1
+                extreme_i = i
+                extreme_p = p
+            continue
+
+        if direction == -1:
+            if p <= extreme_p:
+                extreme_i = i
+                extreme_p = p
+                continue
+            if (p - extreme_p) / (extreme_p if extreme_p else 1e-9) >= threshold:
+                pivots.append({"time": times[extreme_i], "price": float(extreme_p), "kind": "L"})
+                last_pivot_i = extreme_i
+                direction = 1
+                extreme_i = i
+                extreme_p = p
+            continue
+
+    if pivots:
+        last_kind = pivots[-1]["kind"]
+        pivots.append(
+            {
+                "time": times[extreme_i],
+                "price": float(extreme_p),
+                "kind": "H" if last_kind == "L" else "L",
+            }
+        )
+
+    labels = ["1", "2", "3", "4", "5", "A", "B", "C"]
+    if len(pivots) >= 2:
+        start = max(0, len(pivots) - len(labels))
+        j = 0
+        for i in range(start, len(pivots)):
+            pivots[i]["label"] = labels[j]
+            j += 1
+
+    return pivots
+
+
+def get_history_10y(pair):
+    if pair not in PAIRS:
+        raise ValueError("unknown pair")
+
+    ticker = PAIRS[pair]
+    now = time.time()
+
+    with _HISTORY_CACHE_LOCK:
+        hit = _HISTORY_CACHE.get(ticker)
+        if hit and (now - hit.get("ts", 0)) < 600:
+            return hit["df"]
+
+    t = yf.Ticker(ticker)
+    df = t.history(period="10y", interval="1d")
+    if df is None or df.empty or len(df) < 50:
+        raise ValueError("no data")
+
+    df = df.dropna()
+
+    with _HISTORY_CACHE_LOCK:
+        _HISTORY_CACHE[ticker] = {"ts": now, "df": df}
+
+    return df
 
 
 def get_public_config():
@@ -572,11 +816,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 {
                     "stats": st,
                     "config": get_public_config(),
+                    "pairs": list(PAIRS.keys()),
                     "pair_stats": build_pair_stats(account.trades),
                     "open_positions": [p for p in account.positions if p.get("status") == "OPEN"],
                     "last_trades": list(reversed(account.trades[-20:])),
                 },
             )
+            return
+        if self.path.startswith("/api/history"):
+            try:
+                u = urlparse(self.path)
+                q = parse_qs(u.query or "")
+                pair = (q.get("pair") or [""])[0].strip()
+                df = get_history_10y(pair)
+                candles = _df_to_candles(df)
+
+                tail = df.tail(120)
+                ind = get_indicators(tail, pair)
+                sig, reasons = check_signal(ind, enforce_hours=False)
+
+                swings = _zigzag_swings(candles, _history_threshold(pair))
+                swings = swings[-12:]
+
+                self._send_json(
+                    200,
+                    {
+                        "pair": pair,
+                        "candles": candles,
+                        "swings": swings,
+                        "signal": sig,
+                        "signal_reasons": reasons,
+                        "last": {"price": ind.get("price"), "rsi": ind.get("rsi"), "trend": ind.get("trend")},
+                    },
+                )
+            except Exception as e:
+                self._send_json(400, {"ok": False, "error": str(e)})
             return
         if self.path == "/api/equity":
             labels, balances = build_equity_series(account.initial, account.trades)
