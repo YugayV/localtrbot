@@ -1,0 +1,1 @@
+web: python localtrbot/multi_pairs_bot.py
