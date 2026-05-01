@@ -135,14 +135,40 @@ PAIR_CONFIG = {
     "EURGBP": {"priority": 7, "risk_mult": 0.8},
 }
 
-def get_data(ticker, period="5d", interval="1h"):
+_DATA_CACHE = {}
+_DATA_CACHE_LOCK = threading.Lock()
+
+
+def get_data(ticker, period="5d", interval="15m"):
+    now = time.time()
+    key = f"{ticker}|{period}|{interval}"
+
+    ttl = 120
+    if interval in ["1h", "60m"]:
+        ttl = 300
+    if interval in ["15m", "30m"]:
+        ttl = 120
+
+    with _DATA_CACHE_LOCK:
+        hit = _DATA_CACHE.get(key)
+        if hit and (now - hit.get("ts", 0)) < ttl:
+            return hit.get("df")
+
     try:
         t = yf.Ticker(ticker)
         d = t.history(period=period, interval=interval)
-        if d.empty or len(d) < 20:
-            return None
+        if d is None or d.empty or len(d) < 20:
+            raise ValueError("no data")
+
+        with _DATA_CACHE_LOCK:
+            _DATA_CACHE[key] = {"ts": now, "df": d}
+
         return d
     except:
+        with _DATA_CACHE_LOCK:
+            hit = _DATA_CACHE.get(key)
+            if hit:
+                return hit.get("df")
         return None
 
 def get_indicators(data, pair_name):
@@ -216,6 +242,34 @@ def check_signal(ind, enforce_hours=True):
         return -1, signals
 
     return 0, signals
+
+
+def get_intraday_signal(pair, ticker, enforce_hours=True):
+    d15 = get_data(ticker, period="5d", interval="15m")
+    d1h = get_data(ticker, period="60d", interval="1h")
+
+    if d15 is None or d15.empty or d1h is None or d1h.empty:
+        return 0, ["No data"], None, None
+
+    ind15 = get_indicators(d15, pair)
+    ind1h = get_indicators(d1h, pair)
+
+    sig15, reasons = check_signal(ind15, enforce_hours=enforce_hours)
+    sig = sig15
+
+    reasons = list(reasons)
+    reasons.append(f"TF 15m RSI:{ind15['rsi']:.0f} Trend:{'UP' if ind15['trend']==1 else 'DOWN'}")
+    reasons.append(f"Confirm 1h RSI:{ind1h['rsi']:.0f} Trend:{'UP' if ind1h['trend']==1 else 'DOWN'}")
+
+    if sig15 == 1 and ind1h['trend'] != 1:
+        reasons.append("Filter: 1h trend not UP")
+        sig = 0
+    if sig15 == -1 and ind1h['trend'] != -1:
+        reasons.append("Filter: 1h trend not DOWN")
+        sig = 0
+
+    return sig, reasons, ind15, ind1h
+
 
 class Account:
     def __init__(self):
@@ -404,11 +458,19 @@ DASHBOARD_HTML = """<!doctype html>
           <select id=\"pair_select\"></select>
         </div>
         <div>
+          <label>TF</label>
+          <select id=\"tf_select\">
+            <option value=\"15m\">15M</option>
+            <option value=\"1h\">1H</option>
+          </select>
+        </div>
+        <div>
           <label>Signal</label>
           <div class=\"muted\" id=\"signal_box\">Loading...</div>
         </div>
       </div>
       <div id=\"wavechart\" style=\"height:420px;margin-top:10px\"></div>
+      <div class=\"muted\" id=\"plan_box\" style=\"margin-top:8px\"></div>
       <div class=\"muted\" id=\"wave_meta\" style=\"margin-top:8px\"></div>
     </div>
   </div>
@@ -556,10 +618,14 @@ function ensureWaveChart(){
 
 async function loadHistory(pair){
   if (!pair) return;
+  const tfSel = document.getElementById('tf_select');
+  const tf = tfSel ? tfSel.value : '1d';
+
   setText('signal_box', 'Loading...');
+  setText('plan_box', '');
   setText('wave_meta', '');
 
-  const res = await fetch('/api/history?pair=' + encodeURIComponent(pair));
+  const res = await fetch('/api/history?pair=' + encodeURIComponent(pair) + '&tf=' + encodeURIComponent(tf) + '&limit=2000');
   const data = await res.json();
   if (data && data.ok === false) throw new Error(data.error || 'history error');
 
@@ -586,8 +652,20 @@ async function loadHistory(pair){
   if (reasons.length) sigTxt += ' • ' + reasons.join(', ');
   setText('signal_box', sigTxt);
 
+  const plan = data.plan || {};
+  if (plan.direction === 1 || plan.direction === -1){
+    const side = plan.direction === 1 ? 'LONG' : 'SHORT';
+    const rr = (typeof plan.rr === 'number') ? plan.rr.toFixed(2) : '—';
+    setText('plan_box', `Plan: ${side} Entry ${Number(plan.entry).toFixed(5)} • SL ${Number(plan.sl).toFixed(5)} • TP ${Number(plan.tp).toFixed(5)} • RR ${rr}`);
+  }else{
+    setText('plan_box', 'Plan: —');
+  }
+
   const last = data.last || {};
-  const meta = `Pair ${data.pair || pair} • Bars ${candles.length} • RSI ${Number(last.rsi).toFixed(1)} • Price ${Number(last.price).toFixed(5)}`;
+  const imp = data.elliott && data.elliott.impulse ? data.elliott.impulse : null;
+  const impTxt = imp ? (imp.ok ? 'Impulse OK' : ('Impulse INVALID: ' + ((imp.errors || []).join('; ') || 'rules'))) : 'Impulse: —';
+  const warnTxt = imp && imp.warnings && imp.warnings.length ? (' • ' + imp.warnings.join('; ')) : '';
+  const meta = `Pair ${data.pair || pair} • TF ${data.tf || '—'} • Bars ${candles.length} • RSI ${Number(last.rsi).toFixed(1)} • Price ${Number(last.price).toFixed(5)} • ${impTxt}${warnTxt}`;
   setText('wave_meta', meta);
 
   tvChart.timeScale().fitContent();
@@ -617,6 +695,15 @@ async function loadAll(){
 
   const sel = document.getElementById('pair_select');
   if (sel && !sel.value && sel.options.length) sel.value = sel.options[0].value;
+
+  const tfSel = document.getElementById('tf_select');
+  if (tfSel && !tfSel.dataset.bound){
+    tfSel.dataset.bound = '1';
+    tfSel.addEventListener('change', () => {
+      if (sel && sel.value) loadHistory(sel.value).catch(e => setText('signal_box', 'Error: ' + (e?.message || String(e))));
+    });
+  }
+
   if (sel && sel.value && !historyLoadedOnce){
     historyLoadedOnce = true;
     loadHistory(sel.value).catch(e => setText('signal_box', 'Error: ' + (e?.message || String(e))));
@@ -792,28 +879,154 @@ def _zigzag_swings(candles, threshold):
     return pivots
 
 
-def get_history_10y(pair):
+def _elliott_impulse_check(swings):
+    out = {
+        "ok": False,
+        "direction": None,
+        "errors": [],
+        "warnings": [],
+        "metrics": {},
+        "points": [],
+    }
+
+    if not swings or len(swings) < 6:
+        out["errors"].append("Need at least 6 swing points for a 1-5 impulse candidate")
+        return out
+
+    pts = swings[-6:]
+    kinds = [p.get("kind") for p in pts]
+
+    if kinds == ["L", "H", "L", "H", "L", "H"]:
+        direction = 1
+    elif kinds == ["H", "L", "H", "L", "H", "L"]:
+        direction = -1
+    else:
+        out["errors"].append("Swings do not match an alternating 6-point impulse skeleton")
+        return out
+
+    out["direction"] = direction
+
+    p0, p1, p2, p3, p4, p5 = pts
+    s0 = float(p0.get("price", 0) or 0)
+    w1_end = float(p1.get("price", 0) or 0)
+    w2_end = float(p2.get("price", 0) or 0)
+    w3_end = float(p3.get("price", 0) or 0)
+    w4_end = float(p4.get("price", 0) or 0)
+    w5_end = float(p5.get("price", 0) or 0)
+
+    if direction == 1:
+        if w2_end <= s0:
+            out["errors"].append("Invalid impulse: Wave 2 reached/overlapped the start of Wave 1")
+    else:
+        if w2_end >= s0:
+            out["errors"].append("Invalid impulse: Wave 2 reached/overlapped the start of Wave 1")
+
+    w1_len = abs(w1_end - s0)
+    w2_ret = abs(w1_end - w2_end)
+    w3_len = abs(w3_end - w2_end)
+    w5_len = abs(w5_end - w4_end)
+
+    if w1_len > 0:
+        out["metrics"]["wave2_retrace_pct"] = (w2_ret / w1_len) * 100.0
+        if out["metrics"]["wave2_retrace_pct"] > 95:
+            out["warnings"].append("Recommendation: Wave 2 retrace is very deep; consider correction instead of impulse")
+
+    if w1_len > 0 and w3_len > 0 and w5_len > 0:
+        if w3_len <= min(w1_len, w5_len):
+            out["warnings"].append("Recommendation: Wave 3 should not be the shortest among Waves 1, 3, 5")
+
+    if direction == 1:
+        if w4_end <= w1_end:
+            out["warnings"].append("Recommendation: Wave 4 should not overlap Wave 1 territory (non-diagonal impulse)")
+    else:
+        if w4_end >= w1_end:
+            out["warnings"].append("Recommendation: Wave 4 should not overlap Wave 1 territory (non-diagonal impulse)")
+
+    out["ok"] = len(out["errors"]) == 0
+    out["points"] = [
+        {"label": "0", "time": p0.get("time"), "price": s0},
+        {"label": "1", "time": p1.get("time"), "price": w1_end},
+        {"label": "2", "time": p2.get("time"), "price": w2_end},
+        {"label": "3", "time": p3.get("time"), "price": w3_end},
+        {"label": "4", "time": p4.get("time"), "price": w4_end},
+        {"label": "5", "time": p5.get("time"), "price": w5_end},
+    ]
+
+    return out
+
+
+def _apply_impulse_labels(swings, impulse):
+    out = [dict(p) for p in (swings or [])]
+
+    for p in out:
+        if p.get("label") in ["1", "2", "3", "4", "5"]:
+            p.pop("label", None)
+
+    if not impulse or not impulse.get("ok") or len(out) < 6:
+        return out
+
+    pts = out[-6:]
+    pts[1]["label"] = "1"
+    pts[2]["label"] = "2"
+    pts[3]["label"] = "3"
+    pts[4]["label"] = "4"
+    pts[5]["label"] = "5"
+
+    return out
+
+
+def _history_key(ticker, tf):
+    return f"{ticker}|{tf}"
+
+
+def _history_params(tf):
+    tf = (tf or "15m").strip().lower()
+    if tf in ["15m", "15min", "15minute", "m15"]:
+        return "60d", "15m", "15m"
+    if tf in ["1h", "60m", "hour", "h1"]:
+        return "60d", "1h", "1h"
+    return "60d", "15m", "15m"
+
+
+def get_history(pair, tf="1d"):
     if pair not in PAIRS:
         raise ValueError("unknown pair")
 
+    period, interval, tf_norm = _history_params(tf)
     ticker = PAIRS[pair]
     now = time.time()
+    key = _history_key(ticker, tf_norm)
+
+    ttl = 3600
+    if tf_norm == "15m":
+        ttl = 900
 
     with _HISTORY_CACHE_LOCK:
-        hit = _HISTORY_CACHE.get(ticker)
-        if hit and (now - hit.get("ts", 0)) < 600:
-            return hit["df"]
+        hit = _HISTORY_CACHE.get(key)
+        if hit and (now - hit.get("ts", 0)) < ttl:
+            return hit["df"], tf_norm
 
-    t = yf.Ticker(ticker)
-    df = t.history(period="10y", interval="1d")
-    if df is None or df.empty or len(df) < 50:
-        raise ValueError("no data")
+    try:
+        t = yf.Ticker(ticker)
+        df = t.history(period=period, interval=interval)
+        if df is None or df.empty or len(df) < 50:
+            raise ValueError("no data")
+        df = df.dropna()
 
-    df = df.dropna()
+        with _HISTORY_CACHE_LOCK:
+            _HISTORY_CACHE[key] = {"ts": now, "df": df}
 
-    with _HISTORY_CACHE_LOCK:
-        _HISTORY_CACHE[ticker] = {"ts": now, "df": df}
+        return df, tf_norm
+    except Exception:
+        with _HISTORY_CACHE_LOCK:
+            hit = _HISTORY_CACHE.get(key)
+            if hit:
+                return hit["df"], tf_norm
+        raise
 
+
+def get_history_10y(pair):
+    df, _ = get_history(pair, tf="1d")
     return df
 
 
@@ -898,29 +1111,78 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if self.path == "/health":
+            self._send_json(200, {"ok": True})
+            return
         if self.path.startswith("/api/history"):
             try:
                 u = urlparse(self.path)
                 q = parse_qs(u.query or "")
                 pair = (q.get("pair") or [""])[0].strip()
-                df = get_history_10y(pair)
+                tf = (q.get("tf") or ["15m"])[0].strip()
+                limit = int(float((q.get("limit") or ["2000"])[0] or 2000))
+                limit = max(200, min(limit, 5000))
+
+                df, tf_norm = get_history(pair, tf=tf)
+                df = df.tail(limit)
                 candles = _df_to_candles(df)
 
-                tail = df.tail(120)
+                tail = df.tail(240)
                 ind = get_indicators(tail, pair)
-                sig, reasons = check_signal(ind, enforce_hours=False)
+
+                sig = 0
+                reasons = []
+                confirm = None
+
+                if tf_norm == "15m":
+                    sig, reasons, ind15, ind1h = get_intraday_signal(pair, PAIRS[pair], enforce_hours=False)
+                    if ind15 is not None:
+                        ind = ind15
+                    if ind1h is not None:
+                        confirm = {"tf": "1h", "rsi": ind1h.get("rsi"), "trend": ind1h.get("trend"), "price": ind1h.get("price")}
+                else:
+                    sig, reasons = check_signal(ind, enforce_hours=False)
 
                 swings = _zigzag_swings(candles, _history_threshold(pair))
                 swings = swings[-12:]
+
+                impulse = _elliott_impulse_check(swings)
+                swings = _apply_impulse_labels(swings, impulse)
+
+                plan = {"direction": 0}
+                try:
+                    sl_dist, tp_dist = get_sl_tp_distance(pair)
+                    if sig == 1:
+                        plan = {
+                            "direction": 1,
+                            "entry": float(ind.get("price")),
+                            "sl": float(ind.get("price") - sl_dist),
+                            "tp": float(ind.get("price") + tp_dist),
+                            "rr": float(tp_dist / sl_dist) if sl_dist else None,
+                        }
+                    elif sig == -1:
+                        plan = {
+                            "direction": -1,
+                            "entry": float(ind.get("price")),
+                            "sl": float(ind.get("price") + sl_dist),
+                            "tp": float(ind.get("price") - tp_dist),
+                            "rr": float(tp_dist / sl_dist) if sl_dist else None,
+                        }
+                except Exception:
+                    pass
 
                 self._send_json(
                     200,
                     {
                         "pair": pair,
+                        "tf": tf_norm,
                         "candles": candles,
                         "swings": swings,
                         "signal": sig,
                         "signal_reasons": reasons,
+                        "confirm": confirm,
+                        "elliott": {"impulse": impulse},
+                        "plan": plan,
                         "last": {"price": ind.get("price"), "rsi": ind.get("rsi"), "trend": ind.get("trend")},
                     },
                 )
@@ -1008,18 +1270,17 @@ def signal(m):
     best_count = 0
     
     for pair, ticker in PAIRS.items():
-        data = get_data(ticker)
-        if data is None or data.empty:
+        sig, sigs, ind15, ind1h = get_intraday_signal(pair, ticker, enforce_hours=False)
+        if ind15 is None:
             continue
-        ind = get_indicators(data, pair)
-        sig, sigs = check_signal(ind, enforce_hours=False)
-        
+
         if sig != 0:
             direction = "BUY" if sig == 1 else "SELL"
-            text += f"{pair}: <b>{direction}</b> RSI:{ind['rsi']:.0f}\n"
+            conf = "UP" if (ind1h and ind1h.get('trend') == 1) else "DOWN" if (ind1h and ind1h.get('trend') == -1) else "N/A"
+            text += f"{pair}: <b>{direction}</b> TF:15m RSI:{ind15['rsi']:.0f} | 1h:{conf}\n"
             if len(sigs) > best_count:
                 best_count = len(sigs)
-                best = (pair, sig, ind, sigs)
+                best = (pair, sig, ind15, sigs)
     
     if best:
         pair, sig, ind, sigs = best
@@ -1036,14 +1297,11 @@ def trade(m):
     for pair, ticker in PAIRS.items():
         if len([p for p in account.positions if p['pair'] == pair]) >= CONFIG["trades_per_pair"]:
             continue
-        data = get_data(ticker)
-        if data is None or data.empty:
-            continue
-        ind = get_indicators(data, pair)
-        sig, sigs = check_signal(ind, enforce_hours=False)
-        if sig != 0 and len(sigs) > best_count:
+
+        sig, sigs, ind15, ind1h = get_intraday_signal(pair, ticker, enforce_hours=False)
+        if sig != 0 and ind15 is not None and len(sigs) > best_count:
             best_count = len(sigs)
-            best = (pair, sig, ind, sigs)
+            best = (pair, sig, ind15, sigs)
     
     if best is None:
         bot.reply_to(m, "No signals!")
@@ -1218,21 +1476,21 @@ def auto_trade():
             for pair, ticker in PAIRS.items():
                 if len([p for p in account.positions if p['pair'] == pair]) >= trades_per_pair:
                     continue
-                data = get_data(ticker)
-                if data is None or data.empty:
-                    continue
-                ind = get_indicators(data, pair)
                 if not enabled:
                     continue
 
-                sig, sigs = check_signal(ind, enforce_hours=True)
-                
-                if sig != 0 and len(sigs) >= 2:
-                    pos = account.open_trade(sig, ind)
-                    account.save_state()
-                    direction = "LONG" if sig == 1 else "SHORT"
-                    notify(f"AUTO [{direction}]\n\nPair: {pair}\nEntry: {fp(pair, ind)}\n\n" + "\n".join(f"- {s}" for s in sigs))
-                    print(f"Auto: {pair} {direction}")
+                sig, sigs, ind15, ind1h = get_intraday_signal(pair, ticker, enforce_hours=True)
+                if sig == 0 or ind15 is None:
+                    continue
+
+                pos = account.open_trade(sig, ind15)
+                account.save_state()
+                direction = "LONG" if sig == 1 else "SHORT"
+                notify(
+                    f"AUTO [{direction}]\n\nTF: 15m (confirm 1h)\nPair: {pair}\nEntry: {fp(pair, ind15)}\n\n"
+                    + "\n".join(f"- {s}" for s in sigs)
+                )
+                print(f"Auto: {pair} {direction}")
             
             if (now - account.last_report).seconds >= 3600:
                 st = account.stats()
