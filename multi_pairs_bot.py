@@ -712,16 +712,16 @@ def trade(m):
     
     notify(f"TRADE [{direction}]\n\nPair: {pair}\nEntry: {fp(pair, ind)}\n\nSignals:\n" + "\n".join(f"- {s}" for s in sigs))
     
-    bot.reply_to(m, f"""TRADE [{direction}]
-
-Pair: {pair}
-Entry: {fp(pair, ind)}
-SL: {fmt_price(pair, pos['sl'])}
-TP: {fmt_price(pair, pos['tp'])}
-Risk: ${pos['risk']:.2f}
-
-Balance: ${account.balance:.2f}
-    """)
+    msg = (
+        f"TRADE [{direction}]\n\n"
+        f"Pair: {pair}\n"
+        f"Entry: {fp(pair, ind)}\n"
+        f"SL: {fmt_price(pair, pos['sl'])}\n"
+        f"TP: {fmt_price(pair, pos['tp'])}\n"
+        f"Risk: ${pos['risk']:.2f}\n\n"
+        f"Balance: ${account.balance:.2f}"
+    )
+    bot.reply_to(m, msg)
 
 @bot.message_handler(commands=['status'])
 def status(m):
