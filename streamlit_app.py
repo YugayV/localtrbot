@@ -30,7 +30,7 @@ def _start_background():
     t2 = threading.Thread(target=_run_poll, daemon=True)
     t2.start()
 
-    return {"started_at": time.time()}
+    return {"started_at": time.time(), "auto_thread": t1, "poll_thread": t2}
 
 
 def _get_positions_df():
@@ -96,9 +96,33 @@ def _intraday_signal_and_plan(pair: str, tf_norm: str):
     return sig, reasons, ind, None, plan
 
 
-_start_background()
+bg = _start_background()
+
+def _fmt_ts(ts):
+    if not ts:
+        return "—"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
+    except Exception:
+        return str(ts)
 
 st.title("LocalTRBot — Streamlit Dashboard")
+
+auto_alive = bool(bg.get("auto_thread")) and bg["auto_thread"].is_alive()
+poll_alive = bool(bg.get("poll_thread")) and bg["poll_thread"].is_alive()
+rt = getattr(botmod, "RUNTIME", {}) or {}
+
+st.caption(
+    f"Background: auto={auto_alive} polling={poll_alive} | "
+    f"last_loop={_fmt_ts(rt.get('auto_trade_last_loop_ts'))} | "
+    f"last_cycle={_fmt_ts(rt.get('auto_trade_last_cycle_ts'))} | "
+    f"last_open={_fmt_ts(rt.get('auto_trade_last_open_ts'))} {rt.get('auto_trade_last_open_pair') or ''}"
+)
+
+if rt.get("auto_trade_last_error"):
+    st.error(f"Auto-trade error: {rt['auto_trade_last_error']}")
+if rt.get("bot_poll_last_error"):
+    st.error(f"Telegram polling error: {rt['bot_poll_last_error']}")
 
 if botmod.WEBHOOK_BASE_URL and botmod.TELEGRAM_WEBHOOK_SECRET:
     st.warning("WEBHOOK_* переменные заданы, но Streamlit не принимает /telegram/<secret>. Либо убери WEBHOOK env и используй polling, либо запускай встроенный HTTP-сервер вместо Streamlit.")
@@ -117,7 +141,7 @@ with col_right:
     check_interval = st.number_input("Check interval (sec)", min_value=5, value=int(cfg["check_interval"]), step=5)
     auto_trade_enabled = st.selectbox("Auto-trade enabled", ["true", "false"], index=0 if bool(cfg["auto_trade_enabled"]) else 1)
 
-    if st.button("Save settings", use_container_width=True, width="stretch"):
+    if st.button("Save settings", width="stretch"):
         botmod.apply_config_patch(
             {
                 "risk_per_trade": risk_per_trade,

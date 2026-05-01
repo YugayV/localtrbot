@@ -90,6 +90,15 @@ def save_config(cfg):
 
 CONFIG = load_config()
 
+RUNTIME = {
+    "auto_trade_last_loop_ts": None,
+    "auto_trade_last_cycle_ts": None,
+    "auto_trade_last_error": None,
+    "auto_trade_last_open_ts": None,
+    "auto_trade_last_open_pair": None,
+    "bot_poll_last_error": None,
+}
+
 # OPTIMIZED PAIRS (by performance analysis)
 # REMOVED: AUDUSD, USDCHF (0% win rate)
 CRYPTO_PAIRS = {
@@ -1580,6 +1589,7 @@ def dashboard_cmd(m):
 def auto_trade():
     while True:
         try:
+            RUNTIME["auto_trade_last_loop_ts"] = time.time()
             now = datetime.now()
             prices = {}
             
@@ -1614,6 +1624,8 @@ def auto_trade():
 
                 pos = account.open_trade(sig, ind15)
                 account.save_state()
+                RUNTIME["auto_trade_last_open_ts"] = time.time()
+                RUNTIME["auto_trade_last_open_pair"] = pair
                 direction = "LONG" if sig == 1 else "SHORT"
                 notify(
                     f"AUTO [{direction}]\n\nTF: 15m (confirm 1h)\nPair: {pair}\nEntry: {fp(pair, ind15)}\n\n"
@@ -1632,11 +1644,14 @@ def auto_trade():
                 account.last_report = now
                 account.save_state()
             
+            RUNTIME["auto_trade_last_cycle_ts"] = time.time()
+
             with config_lock:
                 interval = int(CONFIG["check_interval"])
             time.sleep(max(1, interval))
         
         except Exception as e:
+            RUNTIME["auto_trade_last_error"] = str(e)
             print(f"Error: {e}")
             time.sleep(60)
 
@@ -1652,6 +1667,7 @@ def run_bot_polling():
             bot.polling(none_stop=True)
             backoff = 5
         except ApiTelegramException as e:
+            RUNTIME["bot_poll_last_error"] = str(e)
             if getattr(e, "error_code", None) == 409:
                 print("Telegram 409 Conflict: another getUpdates is running for this bot token. Ensure only one polling instance is running or enable webhook mode.")
                 time.sleep(15)
@@ -1660,6 +1676,7 @@ def run_bot_polling():
             time.sleep(backoff)
             backoff = min(backoff * 2, 300)
         except Exception as e:
+            RUNTIME["bot_poll_last_error"] = str(e)
             print(f"Polling error: {e}")
             time.sleep(backoff)
             backoff = min(backoff * 2, 300)
