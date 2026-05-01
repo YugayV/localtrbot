@@ -365,62 +365,26 @@ DASHBOARD_HTML = """<!doctype html>
     label{display:block;margin:10px 0 4px;font-size:13px;color:#333}
     input,select{width:100%;padding:8px;border:1px solid #ccc;border-radius:8px}
     button{padding:10px 12px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}
+    button.ghost{background:#fff;color:#111;border:1px solid #ddd}
     .row{display:flex;gap:10px}
     .row>div{flex:1}
     .muted{color:#666;font-size:13px}
     pre{white-space:pre-wrap}
+
+    .fab{position:fixed;right:18px;bottom:18px;z-index:50;border-radius:999px;padding:12px 14px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,.18)}
+    .backdrop{position:fixed;inset:0;background:rgba(0,0,0,.25);z-index:40;opacity:0;pointer-events:none;transition:opacity .18s ease}
+    .backdrop.open{opacity:1;pointer-events:auto}
+    .drawer{position:fixed;top:0;right:0;height:100%;width:min(420px, 92vw);background:#fff;border-left:1px solid #ddd;z-index:60;transform:translateX(100%);transition:transform .18s ease;overflow:auto;padding:16px}
+    .drawer.open{transform:translateX(0)}
+
+    .carousel{margin-top:10px}
+    .slide{display:none}
+    .slide.active{display:block}
   </style>
 </head>
 <body>
   <h2>LocalTRBot Dashboard</h2>
   <div class=\"muted\">Bot + Dashboard running as one service (Railway-friendly).</div>
-
-  <div class=\"grid\" style=\"margin-top:16px\">
-    <div class=\"card\">
-      <h3>Stats</h3>
-      <pre id=\"stats\">Loading...</pre>
-    </div>
-    <div class=\"card\">
-      <h3>Control Panel</h3>
-      <div class=\"row\">
-        <div>
-          <label>Risk per trade (%)</label>
-          <input id=\"risk_per_trade\" type=\"number\" step=\"0.1\" />
-        </div>
-        <div>
-          <label>Trades per pair</label>
-          <input id=\"trades_per_pair\" type=\"number\" step=\"1\" />
-        </div>
-      </div>
-      <div class=\"row\">
-        <div>
-          <label>SL (pips / $)</label>
-          <input id=\"sl_pips\" type=\"number\" step=\"0.01\" />
-        </div>
-        <div>
-          <label>TP (pips / $)</label>
-          <input id=\"tp_pips\" type=\"number\" step=\"0.01\" />
-        </div>
-      </div>
-      <div class=\"row\">
-        <div>
-          <label>Leverage</label>
-          <input id=\"leverage\" type=\"number\" step=\"1\" />
-        </div>
-        <div>
-          <label>Check interval (sec)</label>
-          <input id=\"check_interval\" type=\"number\" step=\"1\" />
-        </div>
-      </div>
-      <label>Auto-trade enabled (true/false)</label>
-      <input id=\"auto_trade_enabled\" />
-
-      <div style=\"margin-top:12px\">
-        <button onclick=\"saveCfg()\">Save settings</button>
-      </div>
-      <div class=\"muted\" id=\"saveMsg\" style=\"margin-top:8px\"></div>
-    </div>
-  </div>
 
   <div class=\"grid\" style=\"margin-top:16px\">
     <div class=\"card\"><h3>Equity</h3><canvas id=\"equity\"></canvas></div>
@@ -445,14 +409,109 @@ DASHBOARD_HTML = """<!doctype html>
     </div>
   </div>
 
+  <button id=\"ctrlBtn\" class=\"fab\" type=\"button\" onclick=\"toggleCtrl()\">Control</button>
+  <div id=\"ctrlBackdrop\" class=\"backdrop\" onclick=\"toggleCtrl(false)\"></div>
+  <div id=\"ctrlDrawer\" class=\"drawer\">
+    <h3 style=\"margin:0\">Control Panel</h3>
+    <div class=\"muted\" style=\"margin-top:6px\">Настройки бота</div>
+
+    <div class=\"row\" style=\"margin-top:10px\">
+      <div>
+        <label>Risk per trade (%)</label>
+        <input id=\"risk_per_trade\" type=\"number\" step=\"0.1\" />
+      </div>
+      <div>
+        <label>Trades per pair</label>
+        <input id=\"trades_per_pair\" type=\"number\" step=\"1\" />
+      </div>
+    </div>
+    <div class=\"row\">
+      <div>
+        <label>SL (pips / $)</label>
+        <input id=\"sl_pips\" type=\"number\" step=\"0.01\" />
+      </div>
+      <div>
+        <label>TP (pips / $)</label>
+        <input id=\"tp_pips\" type=\"number\" step=\"0.01\" />
+      </div>
+    </div>
+    <div class=\"row\">
+      <div>
+        <label>Leverage</label>
+        <input id=\"leverage\" type=\"number\" step=\"1\" />
+      </div>
+      <div>
+        <label>Check interval (sec)</label>
+        <input id=\"check_interval\" type=\"number\" step=\"1\" />
+      </div>
+    </div>
+    <label>Auto-trade enabled (true/false)</label>
+    <input id=\"auto_trade_enabled\" />
+
+    <div class=\"row\" style=\"margin-top:12px\">
+      <button type=\"button\" onclick=\"saveCfg()\">Save settings</button>
+      <button type=\"button\" class=\"ghost\" onclick=\"toggleCtrl(false)\">Close</button>
+    </div>
+    <div class=\"muted\" id=\"saveMsg\" style=\"margin-top:8px\"></div>
+  </div>
+
+  <div class=\"grid\" style=\"margin-top:16px\">
+    <div class=\"card\" style=\"grid-column:1 / -1\">
+      <div class=\"row\" style=\"align-items:center;justify-content:space-between\">
+        <h3 style=\"margin:0\">Stats</h3>
+        <div class=\"row\" style=\"justify-content:flex-end\">
+          <button type=\"button\" class=\"ghost\" onclick=\"prevSlide()\">Prev</button>
+          <button type=\"button\" class=\"ghost\" onclick=\"nextSlide()\">Next</button>
+        </div>
+      </div>
+      <div class=\"carousel\">
+        <div class=\"slide active\" data-slide=\"0\"><pre id=\"stats\">Loading...</pre></div>
+        <div class=\"slide\" data-slide=\"1\"><pre id=\"stats_positions\">Loading...</pre></div>
+        <div class=\"slide\" data-slide=\"2\"><pre id=\"stats_trades\">Loading...</pre></div>
+      </div>
+      <div class=\"muted\" id=\"carousel_label\" style=\"margin-top:8px\"></div>
+    </div>
+  </div>
+
 <script>
 let equityChart, wlChart;
 let tvChart, candleSeries, waveSeries;
 let historyLoadedOnce = false;
+let ctrlOpen = false;
+let slideIndex = 0;
+let carouselInit = false;
+const slideTitles = ['State', 'Open Positions', 'Last Trades'];
 
 function setText(id, t){
   const el = document.getElementById(id);
   if (el) el.textContent = t;
+}
+
+function toggleCtrl(force){
+  ctrlOpen = (typeof force === 'boolean') ? force : !ctrlOpen;
+  const d = document.getElementById('ctrlDrawer');
+  const b = document.getElementById('ctrlBackdrop');
+  if (d) d.classList.toggle('open', ctrlOpen);
+  if (b) b.classList.toggle('open', ctrlOpen);
+}
+
+function setSlide(i){
+  const slides = Array.from(document.querySelectorAll('.slide'));
+  if (!slides.length) return;
+  slideIndex = (i + slides.length) % slides.length;
+  for (const s of slides){
+    const n = Number(s.getAttribute('data-slide') || 0);
+    s.classList.toggle('active', n === slideIndex);
+  }
+  setText('carousel_label', slideTitles[slideIndex] || '');
+}
+
+function nextSlide(){
+  setSlide(slideIndex + 1);
+}
+
+function prevSlide(){
+  setSlide(slideIndex - 1);
 }
 
 function ensurePairs(pairs){
@@ -532,7 +591,19 @@ async function loadHistory(pair){
 
 async function loadAll(){
   const st = await fetch('/api/state').then(r=>r.json());
-  document.getElementById('stats').textContent = JSON.stringify(st, null, 2);
+  const statsEl = document.getElementById('stats');
+  if (statsEl) statsEl.textContent = JSON.stringify(st, null, 2);
+
+  const posEl = document.getElementById('stats_positions');
+  if (posEl) posEl.textContent = JSON.stringify(st.open_positions || [], null, 2);
+
+  const trEl = document.getElementById('stats_trades');
+  if (trEl) trEl.textContent = JSON.stringify(st.last_trades || [], null, 2);
+
+  if (!carouselInit){
+    carouselInit = true;
+    setSlide(0);
+  }
 
   for (const k of ['risk_per_trade','trades_per_pair','sl_pips','tp_pips','leverage','check_interval','auto_trade_enabled']){
     document.getElementById(k).value = st.config[k];
