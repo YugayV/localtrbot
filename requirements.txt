@@ -2,7 +2,5 @@ pyTelegramBotAPI
 yfinance
 pandas
 numpy
-streamlit 
+streamlit
 plotly
-chart_st
-chart_st_libraries
