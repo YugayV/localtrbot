@@ -6,6 +6,7 @@ Notifications: Trade alerts + Hourly reports
 """
 
 import telebot
+from telebot import types
 from telebot.apihelper import ApiTelegramException
 import logging
 import yfinance as yf
@@ -89,9 +90,35 @@ CONFIG = load_config()
 
 # OPTIMIZED PAIRS (by performance analysis)
 # REMOVED: AUDUSD, USDCHF (0% win rate)
+CRYPTO_PAIRS = {
+    "BTCUSD",
+    "ETHUSD",
+    "SOLUSD",
+    "XRPUSD",
+    "BNBUSD",
+    "ADAUSD",
+    "DOGEUSD",
+    "AVAXUSD",
+    "LINKUSD",
+    "DOTUSD",
+    "LTCUSD",
+    "MATICUSD",
+}
+
 PAIRS = {
     "BTCUSD": "BTC-USD",   # BEST: 64% WR, +$428
     "ETHUSD": "ETH-USD",   # 2nd best: 47% WR, +$271
+    "SOLUSD": "SOL-USD",
+    "XRPUSD": "XRP-USD",
+    "BNBUSD": "BNB-USD",
+    "ADAUSD": "ADA-USD",
+    "DOGEUSD": "DOGE-USD",
+    "AVAXUSD": "AVAX-USD",
+    "LINKUSD": "LINK-USD",
+    "DOTUSD": "DOT-USD",
+    "LTCUSD": "LTC-USD",
+    "MATICUSD": "MATIC-USD",
+
     "USDJPY": "USDJPY=X",  # 40% WR, +$141
     "EURJPY": "EURJPY=X",  # 37% WR, +$96
     "EURUSD": "EURUSD=X",
@@ -107,8 +134,13 @@ GOOD_HOURS = [5, 7, 8, 18, 19]
 
 
 def fmt_price(pair, price):
-    if pair in ["BTCUSD", "ETHUSD"]:
-        return f"{price:.2f}"
+    if pair in CRYPTO_PAIRS:
+        p = float(price)
+        if abs(p) >= 100:
+            return f"{p:.2f}"
+        if abs(p) >= 1:
+            return f"{p:.4f}"
+        return f"{p:.6f}"
     if pair.endswith("JPY"):
         return f"{price:.3f}"
     return f"{price:.5f}"
@@ -119,7 +151,7 @@ def get_sl_tp_distance(pair):
         sl_pips = float(CONFIG["sl_pips"])
         tp_pips = float(CONFIG["tp_pips"])
 
-    if pair in ["BTCUSD", "ETHUSD"]:
+    if pair in CRYPTO_PAIRS:
         return sl_pips, tp_pips
 
     pip = 0.01 if pair.endswith("JPY") else 0.0001
@@ -129,11 +161,22 @@ def get_sl_tp_distance(pair):
 PAIR_CONFIG = {
     "BTCUSD": {"priority": 1, "risk_mult": 1.5},  # Top performer
     "ETHUSD": {"priority": 2, "risk_mult": 1.2},
-    "USDJPY": {"priority": 3, "risk_mult": 1.0},
-    "EURJPY": {"priority": 4, "risk_mult": 1.0},
-    "EURUSD": {"priority": 5, "risk_mult": 0.8},
-    "GBPUSD": {"priority": 6, "risk_mult": 0.8},
-    "EURGBP": {"priority": 7, "risk_mult": 0.8},
+    "SOLUSD": {"priority": 3, "risk_mult": 1.0},
+    "XRPUSD": {"priority": 4, "risk_mult": 1.0},
+    "BNBUSD": {"priority": 5, "risk_mult": 1.0},
+    "ADAUSD": {"priority": 6, "risk_mult": 1.0},
+    "DOGEUSD": {"priority": 7, "risk_mult": 1.0},
+    "AVAXUSD": {"priority": 8, "risk_mult": 1.0},
+    "LINKUSD": {"priority": 9, "risk_mult": 1.0},
+    "DOTUSD": {"priority": 10, "risk_mult": 1.0},
+    "LTCUSD": {"priority": 11, "risk_mult": 1.0},
+    "MATICUSD": {"priority": 12, "risk_mult": 1.0},
+
+    "USDJPY": {"priority": 13, "risk_mult": 1.0},
+    "EURJPY": {"priority": 14, "risk_mult": 1.0},
+    "EURUSD": {"priority": 15, "risk_mult": 0.8},
+    "GBPUSD": {"priority": 16, "risk_mult": 0.8},
+    "EURGBP": {"priority": 17, "risk_mult": 0.8},
 }
 
 _DATA_CACHE = {}
@@ -341,11 +384,11 @@ class Account:
         pair = ind['pair']
 
         with config_lock:
-            risk_pct = float(CONFIG["risk_per_trade"])
+            risk_pct = 10.0
             leverage = float(CONFIG["leverage"])
             sl_pips = float(CONFIG["sl_pips"])
 
-        risk = self.balance * (risk_pct / 100)
+        risk = self.balance * (risk_pct / 100.0)
         sl_dist, tp_dist = get_sl_tp_distance(pair)
 
         if direction == 1:
@@ -886,7 +929,7 @@ _HISTORY_CACHE_LOCK = threading.Lock()
 
 
 def _pair_is_crypto(pair):
-    return pair in ["BTCUSD", "ETHUSD"]
+    return pair in CRYPTO_PAIRS
 
 
 def _history_threshold(pair, tf):
@@ -1351,19 +1394,35 @@ def fp(pair, ind):
 
 @bot.message_handler(commands=['start'])
 def start(m):
-    bot.reply_to(m, """MULTI-PAIRS BOT
+    pairs_line = ", ".join(PAIRS.keys())
+
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(
+        types.KeyboardButton('/market'),
+        types.KeyboardButton('/signal'),
+        types.KeyboardButton('/trade'),
+        types.KeyboardButton('/status'),
+        types.KeyboardButton('/stats'),
+        types.KeyboardButton('/dashboard'),
+    )
+
+    bot.send_message(
+        m.chat.id,
+        f"""MULTI-PAIRS BOT
 =====================
 
-Pairs: BTCUSD, ETHUSD, USDJPY, EURJPY, EURUSD, GBPUSD, EURGBP
+Pairs: {pairs_line}
 
-Commands:
-/signal - All signals
-/trade - Best trade
-/status - Account
-/market - Market data
-/stats - Performance
-/dashboard - Dashboard
-    """)
+Выбери команду кнопкой ниже или введи вручную:
+/market
+/signal
+/trade
+/status
+/stats
+/dashboard
+""",
+        reply_markup=kb,
+    )
 
 @bot.message_handler(commands=['market'])
 def market(m):
@@ -1472,8 +1531,8 @@ Win Rate: {st['wr']:.1f}%
 
 
 @bot.message_handler(commands=['dashboard'])
-def dashboard(m):
-    st = account.stats()
+def dashboard_cmd(m):
+    stt = account.stats()
 
     last_trades = account.trades[-5:]
     last_text = "\n".join(
@@ -1490,78 +1549,22 @@ def dashboard(m):
     bot.reply_to(
         m,
         f"<b>DASHBOARD</b>\n\n"
-        f"Balance: ${st['balance']:.2f}\n"
-        f"Return: {st['return']:+.2f}%\n"
-        f"Trades: {st['trades']} | WR: {st['wr']:.1f}%\n"
-        f"Peak: ${st['peak']:.2f}\n"
-        f"Max DD: {st['max_dd']:.2f}%\n"
-        f"Open: {st['open']}\n\n"
+        f"Balance: ${stt['balance']:.2f}\n"
+        f"Return: {stt['return']:+.2f}%\n"
+        f"Trades: {stt['trades']} | WR: {stt['wr']:.1f}%\n"
+        f"Peak: ${stt['peak']:.2f}\n"
+        f"Max DD: {stt['max_dd']:.2f}%\n"
+        f"Open: {stt['open']}\n\n"
         f"<b>Open Positions</b>\n{open_text if open_text else '(none)'}\n\n"
         f"<b>Last 5 Trades</b>\n{last_text if last_text else '(none)'}",
         parse_mode='HTML',
     )
 
 
-@bot.message_handler(commands=['dashboard'])
-def dashboard(m):
-    st = account.stats()
-
-    last_trades = account.trades[-5:]
-    last_text = "\n".join(
-        f"- {t['pair']} {('LONG' if t['direction']==1 else 'SHORT')} {t['status']} ${t.get('pnl', 0):+.2f}"
-        for t in reversed(last_trades)
-    )
-
-    open_text = "\n".join(
-        f"- {p['pair']} {('LONG' if p['direction']==1 else 'SHORT')} Entry:{fmt_price(p['pair'], p['entry'])} SL:{fmt_price(p['pair'], p['sl'])} TP:{fmt_price(p['pair'], p['tp'])}"
-        for p in account.positions
-        if p.get('status') == 'OPEN'
-    )
-
-    bot.reply_to(
-        m,
-        f"<b>DASHBOARD</b>\n\n"
-        f"Balance: ${st['balance']:.2f}\n"
-        f"Return: {st['return']:+.2f}%\n"
-        f"Trades: {st['trades']} | WR: {st['wr']:.1f}%\n"
-        f"Peak: ${st['peak']:.2f}\n"
-        f"Max DD: {st['max_dd']:.2f}%\n"
-        f"Open: {st['open']}\n\n"
-        f"<b>Open Positions</b>\n{open_text if open_text else '(none)'}\n\n"
-        f"<b>Last 5 Trades</b>\n{last_text if last_text else '(none)'}",
-        parse_mode='HTML',
-    )
 
 
-@bot.message_handler(commands=['dashboard'])
-def dashboard(m):
-    st = account.stats()
 
-    last_trades = account.trades[-5:]
-    last_text = "\n".join(
-        f"- {t['pair']} {('LONG' if t['direction']==1 else 'SHORT')} {t['status']} ${t.get('pnl', 0):+.2f}"
-        for t in reversed(last_trades)
-    )
 
-    open_text = "\n".join(
-        f"- {p['pair']} {('LONG' if p['direction']==1 else 'SHORT')} Entry:{fmt_price(p['pair'], p['entry'])} SL:{fmt_price(p['pair'], p['sl'])} TP:{fmt_price(p['pair'], p['tp'])}"
-        for p in account.positions
-        if p.get('status') == 'OPEN'
-    )
-
-    bot.reply_to(
-        m,
-        f"<b>DASHBOARD</b>\n\n"
-        f"Balance: ${st['balance']:.2f}\n"
-        f"Return: {st['return']:+.2f}%\n"
-        f"Trades: {st['trades']} | WR: {st['wr']:.1f}%\n"
-        f"Peak: ${st['peak']:.2f}\n"
-        f"Max DD: {st['max_dd']:.2f}%\n"
-        f"Open: {st['open']}\n\n"
-        f"<b>Open Positions</b>\n{open_text if open_text else '(none)'}\n\n"
-        f"<b>Last 5 Trades</b>\n{last_text if last_text else '(none)'}",
-        parse_mode='HTML',
-    )
 
 def auto_trade():
     while True:
