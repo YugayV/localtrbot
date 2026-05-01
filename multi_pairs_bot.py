@@ -7,6 +7,7 @@ Notifications: Trade alerts + Hourly reports
 
 import telebot
 from telebot.apihelper import ApiTelegramException
+import logging
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -433,6 +434,8 @@ class Account:
         }
 
 bot = telebot.TeleBot(BOT_TOKEN)
+telebot.logger.setLevel(logging.CRITICAL)
+telebot.logger.propagate = False
 account = Account()
 current_prices = {}
 
@@ -1662,8 +1665,12 @@ def main():
             url = WEBHOOK_BASE_URL.rstrip("/") + f"/telegram/{TELEGRAM_WEBHOOK_SECRET}"
             ok = bot.set_webhook(url=url)
             print(f"Telegram webhook: {'OK' if ok else 'FAILED'} -> {url}")
+            if not ok:
+                raise RuntimeError("set_webhook returned False")
         except Exception as e:
             print(f"Webhook setup error: {e}")
+            t2 = threading.Thread(target=run_bot_polling, daemon=True)
+            t2.start()
     else:
         t2 = threading.Thread(target=run_bot_polling, daemon=True)
         t2.start()
