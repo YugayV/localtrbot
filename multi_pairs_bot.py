@@ -17,6 +17,8 @@ import time
 import threading
 import json
 import os
+import contextlib
+import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -60,7 +62,7 @@ CONFIG_DEFAULTS = {
     "leverage": 10,
     "sl_pips": 100,
     "tp_pips": 300,
-    "check_interval": 1800,
+    "check_interval": 120,
     "auto_trade_enabled": True,
 }
 
@@ -207,7 +209,9 @@ def get_data(ticker, period="5d", interval="15m"):
 
         try:
             t = yf.Ticker(tk)
-            d = t.history(period=period, interval=interval)
+            _buf = io.StringIO()
+            with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):
+                d = t.history(period=period, interval=interval)
             if d is None or d.empty or len(d) < 20:
                 raise ValueError("no data")
 
@@ -260,7 +264,7 @@ def check_signal(ind, enforce_hours=True):
     sma = ind['sma']
     change = ind['change']
 
-    proxy = -change
+    proxy = change
 
     if proxy < -0.02 and rsi < 45:
         signals.append("Proxy DOWN + RSI")
@@ -282,12 +286,10 @@ def check_signal(ind, enforce_hours=True):
     if enforce_hours and get_seoul_time().hour not in GOOD_HOURS:
         return 0, signals
 
-    buy = sum(1 for s in signals if any(x in s for x in ["DOWN", "Oversold"]))
-    sell = sum(1 for s in signals if any(x in s for x in ["UP", "Overbought"]))
+    buy = sum(1 for s in signals if any(x in s for x in ["DOWN", "Oversold", "Trend Up"]))
+    sell = sum(1 for s in signals if any(x in s for x in ["UP", "Overbought", "Trend Down"]))
 
     min_signals = 2
-    if PAIR_CONFIG.get(ind['pair'], {}).get('priority', 99) > 2:
-        min_signals = 3
 
     if buy >= min_signals and buy > sell:
         return 1, signals
@@ -1606,7 +1608,7 @@ def auto_trade():
                 if not enabled:
                     continue
 
-                sig, sigs, ind15, ind1h = get_intraday_signal(pair, ticker, enforce_hours=True)
+                sig, sigs, ind15, ind1h = get_intraday_signal(pair, ticker, enforce_hours=False)
                 if sig == 0 or ind15 is None:
                     continue
 
