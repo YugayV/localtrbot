@@ -860,32 +860,33 @@ def trade(m):
 def status(m):
     st = account.stats()
     open_pos = "\n".join(f"- {p['pair']} {'LONG' if p['direction']==1 else 'SHORT'}" for p in account.positions)
-    
-    bot.reply_to(m, f"""Account
-========
 
-Balance: ${st['balance']:.2f}
-Return: {st['return']:+.2f}%
+    msg = (
+        "Account\n"
+        "========\n\n"
+        f"Balance: ${st['balance']:.2f}\n"
+        f"Return: {st['return']:+.2f}%\n\n"
+        f"Trades: {st['trades']} | WR: {st['wr']:.1f}%\n"
+        f"Open: {st['open']}\n"
+        f"{open_pos if open_pos else '(none)'}\n\n"
+        f"Peak: ${st['peak']:.2f}\n"
+        f"Max DD: {st['max_dd']:.2f}%"
+    )
+    bot.reply_to(m, msg)
 
-Trades: {st['trades']} | WR: {st['wr']:.1f}%
-Open: {st['open']}
-{open_pos if open_pos else '(none)'}
-
-Peak: ${st['peak']:.2f}
-Max DD: {st['max_dd']:.2f}%
-    """)
 
 @bot.message_handler(commands=['stats'])
 def stats(m):
     st = account.stats()
-    bot.reply_to(m, f"""Stats
-=====
-
-Balance: ${st['balance']:.2f}
-Return: {st['return']:+.2f}%
-Trades: {st['trades']}
-Win Rate: {st['wr']:.1f}%
-    """)
+    msg = (
+        "Stats\n"
+        "=====\n\n"
+        f"Balance: ${st['balance']:.2f}\n"
+        f"Return: {st['return']:+.2f}%\n"
+        f"Trades: {st['trades']}\n"
+        f"Win Rate: {st['wr']:.1f}%"
+    )
+    bot.reply_to(m, msg)
 
 
 @bot.message_handler(commands=['dashboard'])
