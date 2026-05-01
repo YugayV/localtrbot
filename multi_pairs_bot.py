@@ -261,12 +261,40 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
     reasons.append(f"TF 15m RSI:{ind15['rsi']:.0f} Trend:{'UP' if ind15['trend']==1 else 'DOWN'}")
     reasons.append(f"Confirm 1h RSI:{ind1h['rsi']:.0f} Trend:{'UP' if ind1h['trend']==1 else 'DOWN'}")
 
+    if sig15 == 1 and ind15['trend'] != 1:
+        reasons.append("Filter: 15m trend not UP")
+        sig = 0
+    if sig15 == -1 and ind15['trend'] != -1:
+        reasons.append("Filter: 15m trend not DOWN")
+        sig = 0
+
     if sig15 == 1 and ind1h['trend'] != 1:
         reasons.append("Filter: 1h trend not UP")
         sig = 0
     if sig15 == -1 and ind1h['trend'] != -1:
         reasons.append("Filter: 1h trend not DOWN")
         sig = 0
+
+    if sig15 == 1 and float(ind1h.get('rsi', 50) or 50) < 50:
+        reasons.append("Filter: 1h RSI < 50")
+        sig = 0
+    if sig15 == -1 and float(ind1h.get('rsi', 50) or 50) > 50:
+        reasons.append("Filter: 1h RSI > 50")
+        sig = 0
+
+    try:
+        lookback = 20
+        if len(d15) > lookback + 2:
+            prev_high = float(d15['High'].iloc[-(lookback + 1):-1].max())
+            prev_low = float(d15['Low'].iloc[-(lookback + 1):-1].min())
+            if sig15 == 1 and float(ind15.get('price')) < prev_high:
+                reasons.append("Filter: no 20-bar breakout")
+                sig = 0
+            if sig15 == -1 and float(ind15.get('price')) > prev_low:
+                reasons.append("Filter: no 20-bar breakdown")
+                sig = 0
+    except Exception:
+        pass
 
     return sig, reasons, ind15, ind1h
 
@@ -465,6 +493,15 @@ DASHBOARD_HTML = """<!doctype html>
           </select>
         </div>
         <div>
+          <label>ZigZag</label>
+          <input id=\"zz_mult\" type=\"range\" min=\"0.5\" max=\"3\" step=\"0.1\" value=\"1\" />
+          <div class=\"muted\" id=\"zz_val\">1.0x</div>
+        </div>
+        <div>
+          <label>Only Valid</label>
+          <input id=\"only_valid\" type=\"checkbox\" />
+        </div>
+        <div>
           <label>Signal</label>
           <div class=\"muted\" id=\"signal_box\">Loading...</div>
         </div>
@@ -542,6 +579,8 @@ DASHBOARD_HTML = """<!doctype html>
 <script>
 let equityChart, wlChart;
 let tvChart, candleSeries, waveSeries;
+let priceLines = [];
+let openPosByPair = {};
 let historyLoadedOnce = false;
 let ctrlOpen = false;
 let slideIndex = 0;
@@ -619,13 +658,19 @@ function ensureWaveChart(){
 async function loadHistory(pair){
   if (!pair) return;
   const tfSel = document.getElementById('tf_select');
-  const tf = tfSel ? tfSel.value : '1d';
+  const tf = tfSel ? tfSel.value : '15m';
+
+  const zzEl = document.getElementById('zz_mult');
+  const zz = zzEl ? Number(zzEl.value) : 1.0;
+  setText('zz_val', (Number.isFinite(zz) ? zz.toFixed(1) : '1.0') + 'x');
+
+  const onlyValid = !!(document.getElementById('only_valid') && document.getElementById('only_valid').checked);
 
   setText('signal_box', 'Loading...');
   setText('plan_box', '');
   setText('wave_meta', '');
 
-  const res = await fetch('/api/history?pair=' + encodeURIComponent(pair) + '&tf=' + encodeURIComponent(tf) + '&limit=2000');
+  const res = await fetch('/api/history?pair=' + encodeURIComponent(pair) + '&tf=' + encodeURIComponent(tf) + '&limit=2000&zz=' + encodeURIComponent(String(zz || 1.0)));
   const data = await res.json();
   if (data && data.ok === false) throw new Error(data.error || 'history error');
 
@@ -635,15 +680,50 @@ async function loadHistory(pair){
   const candles = Array.isArray(data.candles) ? data.candles : [];
   candleSeries.setData(candles);
 
+  if (priceLines.length){
+    for (const pl of priceLines){
+      try{ candleSeries.removePriceLine(pl); }catch(e){}
+    }
+    priceLines = [];
+  }
+
+  const dashed = (window.LightweightCharts && LightweightCharts.LineStyle && LightweightCharts.LineStyle.Dashed) || 2;
+  const posList = (openPosByPair && openPosByPair[pair]) ? openPosByPair[pair] : [];
+  for (const p of posList){
+    const side = p.direction === 1 ? 'LONG' : 'SHORT';
+    try{
+      priceLines.push(candleSeries.createPriceLine({ price: Number(p.entry), color: 'rgba(17,17,17,.85)', lineWidth: 2, lineStyle: dashed, axisLabelVisible: true, title: side + ' Entry' }));
+      priceLines.push(candleSeries.createPriceLine({ price: Number(p.sl), color: 'rgba(209,36,47,.85)', lineWidth: 2, lineStyle: dashed, axisLabelVisible: true, title: 'SL' }));
+      priceLines.push(candleSeries.createPriceLine({ price: Number(p.tp), color: 'rgba(26,127,55,.85)', lineWidth: 2, lineStyle: dashed, axisLabelVisible: true, title: 'TP' }));
+    }catch(e){}
+  }
+
+  const plan = data.plan || {};
+  if ((plan.direction === 1 || plan.direction === -1) && !posList.length){
+    try{
+      priceLines.push(candleSeries.createPriceLine({ price: Number(plan.entry), color: 'rgba(17,17,17,.85)', lineWidth: 2, lineStyle: dashed, axisLabelVisible: true, title: 'Plan Entry' }));
+      priceLines.push(candleSeries.createPriceLine({ price: Number(plan.sl), color: 'rgba(209,36,47,.85)', lineWidth: 2, lineStyle: dashed, axisLabelVisible: true, title: 'Plan SL' }));
+      priceLines.push(candleSeries.createPriceLine({ price: Number(plan.tp), color: 'rgba(26,127,55,.85)', lineWidth: 2, lineStyle: dashed, axisLabelVisible: true, title: 'Plan TP' }));
+    }catch(e){}
+  }
+
+  const imp = data.elliott && data.elliott.impulse ? data.elliott.impulse : null;
+  const impOk = imp ? !!imp.ok : null;
+
   const swings = Array.isArray(data.swings) ? data.swings : [];
-  waveSeries.setData(swings.map(p => ({ time: p.time, value: p.price })));
-  candleSeries.setMarkers(swings.map(p => ({
-    time: p.time,
-    position: (p.kind === 'H') ? 'aboveBar' : 'belowBar',
-    color: '#111111',
-    shape: (p.kind === 'H') ? 'arrowDown' : 'arrowUp',
-    text: p.label || '',
-  })));
+  if (onlyValid && impOk === false){
+    waveSeries.setData([]);
+    candleSeries.setMarkers([]);
+  }else{
+    waveSeries.setData(swings.map(p => ({ time: p.time, value: p.price })));
+    candleSeries.setMarkers(swings.map(p => ({
+      time: p.time,
+      position: (p.kind === 'H') ? 'aboveBar' : 'belowBar',
+      color: '#111111',
+      shape: (p.kind === 'H') ? 'arrowDown' : 'arrowUp',
+      text: p.label || '',
+    })));
+  }
 
   let sigTxt = 'No signal';
   if (data.signal === 1) sigTxt = 'BUY signal';
@@ -678,6 +758,14 @@ async function loadAll(){
 
   const posEl = document.getElementById('stats_positions');
   if (posEl) posEl.textContent = JSON.stringify(st.open_positions || [], null, 2);
+
+  const opens = Array.isArray(st.open_positions) ? st.open_positions : [];
+  openPosByPair = {};
+  for (const p of opens){
+    const k = p && p.pair ? p.pair : '?';
+    if (!openPosByPair[k]) openPosByPair[k] = [];
+    openPosByPair[k].push(p);
+  }
 
   const trEl = document.getElementById('stats_trades');
   if (trEl) trEl.textContent = JSON.stringify(st.last_trades || [], null, 2);
@@ -779,8 +867,11 @@ def _pair_is_crypto(pair):
     return pair in ["BTCUSD", "ETHUSD"]
 
 
-def _history_threshold(pair):
-    return 0.04 if _pair_is_crypto(pair) else 0.015
+def _history_threshold(pair, tf):
+    tf = (tf or "15m").strip().lower()
+    if _pair_is_crypto(pair):
+        return 0.02 if tf == "15m" else 0.03
+    return 0.006 if tf == "15m" else 0.012
 
 
 def _df_to_candles(df):
@@ -1122,6 +1213,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 tf = (q.get("tf") or ["15m"])[0].strip()
                 limit = int(float((q.get("limit") or ["2000"])[0] or 2000))
                 limit = max(200, min(limit, 5000))
+                zz = float((q.get("zz") or ["1.0"])[0] or 1.0)
+                zz = max(0.5, min(zz, 3.0))
 
                 df, tf_norm = get_history(pair, tf=tf)
                 df = df.tail(limit)
@@ -1143,7 +1236,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 else:
                     sig, reasons = check_signal(ind, enforce_hours=False)
 
-                swings = _zigzag_swings(candles, _history_threshold(pair))
+                swings = _zigzag_swings(candles, _history_threshold(pair, tf_norm) * zz)
                 swings = swings[-12:]
 
                 impulse = _elliott_impulse_check(swings)
