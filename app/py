@@ -1,0 +1,955 @@
+import telebot
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone, timedelta
+import time
+import threading
+import json
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_env(path):
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+
+
+load_env(os.path.join(BASE_DIR, ".env"))
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
+
+if not BOT_TOKEN or not ADMIN_ID:
+    raise RuntimeError("Missing BOT_TOKEN or ADMIN_ID in .env")
+
+STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")
+CONFIG_FILE = os.path.join(BASE_DIR, "bot_config.json")
+config_lock = threading.Lock()
+
+CONFIG_DEFAULTS = {
+    "initial_balance": 1000.0,
+    "trades_per_pair": 2,
+    "risk_per_trade": 10.0,
+    "leverage": 10,
+    "sl_pips": 100,
+    "tp_pips": 300,
+    "check_interval": 1800,
+    "auto_trade_enabled": True,
+}
+
+
+def load_config():
+    cfg = dict(CONFIG_DEFAULTS)
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k in cfg.keys():
+                    if k in data:
+                        cfg[k] = data[k]
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+
+CONFIG = load_config()
+
+PAIRS = {
+    "BTCUSD": "BTC-USD",
+    "ETHUSD": "ETH-USD",
+    "USDJPY": "USDJPY=X",
+    "EURJPY": "EURJPY=X",
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "EURGBP": "EURGBP=X",
+}
+
+PAIR_CONFIG = {
+    "BTCUSD": {"priority": 1, "risk_mult": 1.5},
+    "ETHUSD": {"priority": 2, "risk_mult": 1.2},
+    "USDJPY": {"priority": 3, "risk_mult": 1.0},
+    "EURJPY": {"priority": 4, "risk_mult": 1.0},
+    "EURUSD": {"priority": 5, "risk_mult": 0.8},
+    "GBPUSD": {"priority": 6, "risk_mult": 0.8},
+    "EURGBP": {"priority": 7, "risk_mult": 0.8},
+}
+
+
+def get_seoul_time():
+    return datetime.now(timezone(timedelta(hours=9)))
+
+
+GOOD_HOURS = [5, 7, 8, 18, 19]
+
+
+def fmt_price(pair, price):
+    if pair in ["BTCUSD", "ETHUSD"]:
+        return f"{price:.2f}"
+    if pair.endswith("JPY"):
+        return f"{price:.3f}"
+    return f"{price:.5f}"
+
+
+def get_sl_tp_distance(pair):
+    with config_lock:
+        sl_pips = float(CONFIG["sl_pips"])
+        tp_pips = float(CONFIG["tp_pips"])
+
+    if pair in ["BTCUSD", "ETHUSD"]:
+        return sl_pips, tp_pips
+
+    pip = 0.01 if pair.endswith("JPY") else 0.0001
+    return sl_pips * pip, tp_pips * pip
+
+
+def get_data(ticker, period="5d", interval="1h"):
+    try:
+        t = yf.Ticker(ticker)
+        d = t.history(period=period, interval=interval)
+        if d.empty or len(d) < 20:
+            return None
+        return d
+    except Exception:
+        return None
+
+
+def get_indicators(data, pair_name):
+    closes = data["Close"].values
+    deltas = np.diff(closes)
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+    avg_gain = pd.Series(gains).rolling(14).mean().iloc[-1]
+    avg_loss_raw = pd.Series(losses).rolling(14).mean().iloc[-1]
+    avg_loss = avg_loss_raw if avg_loss_raw > 0 else 0.00001
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    sma = pd.Series(closes).rolling(20).mean().iloc[-1]
+    trend = 1 if closes[-1] > sma else -1
+    change = ((closes[-1] - closes[-2]) / closes[-2]) * 100 if len(closes) > 1 else 0
+
+    return {
+        "price": closes[-1],
+        "prev": closes[-2] if len(closes) > 1 else closes[-1],
+        "change": change,
+        "rsi": float(rsi),
+        "trend": int(trend),
+        "sma": float(sma),
+        "pair": pair_name,
+    }
+
+
+def check_signal(ind, enforce_hours=True):
+    signals = []
+    rsi = ind["rsi"]
+    trend = ind["trend"]
+    price = ind["price"]
+    sma = ind["sma"]
+    change = ind["change"]
+
+    proxy = -change
+
+    if proxy < -0.02 and rsi < 45:
+        signals.append("Proxy DOWN + RSI")
+    if proxy > 0.02 and rsi > 55:
+        signals.append("Proxy UP + RSI")
+    if rsi < 35:
+        signals.append("RSI Oversold")
+    if rsi > 65:
+        signals.append("RSI Overbought")
+    if trend == 1 and price < sma * 1.002:
+        signals.append("Trend Up")
+    if trend == -1 and price > sma * 0.998:
+        signals.append("Trend Down")
+    if proxy < -0.03:
+        signals.append("Strong Down")
+    if proxy > 0.03:
+        signals.append("Strong Up")
+
+    if enforce_hours and get_seoul_time().hour not in GOOD_HOURS:
+        return 0, signals
+
+    buy = sum(1 for s in signals if any(x in s for x in ["DOWN", "Oversold"]))
+    sell = sum(1 for s in signals if any(x in s for x in ["UP", "Overbought"]))
+
+    min_signals = 2
+    if PAIR_CONFIG.get(ind["pair"], {}).get("priority", 99) > 2:
+        min_signals = 3
+
+    if buy >= min_signals and buy > sell:
+        return 1, signals
+    if sell >= min_signals and sell > buy:
+        return -1, signals
+
+    return 0, signals
+
+
+class Account:
+    def __init__(self):
+        with config_lock:
+            self.balance = float(CONFIG["initial_balance"])
+            self.initial = float(CONFIG["initial_balance"])
+        self.trades = []
+        self.positions = []
+        self.peak = self.balance
+        self.max_dd = 0.0
+        self.last_report = datetime.now()
+        self.load_state()
+
+    def load_state(self):
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.balance = float(data.get("balance", self.balance))
+                self.initial = float(data.get("initial", self.initial))
+                self.trades = data.get("trades", []) or []
+                self.peak = float(data.get("peak", self.balance))
+                self.max_dd = float(data.get("max_dd", 0.0))
+            except Exception:
+                pass
+
+    def save_state(self):
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "balance": self.balance,
+                        "initial": self.initial,
+                        "trades": self.trades[-100:],
+                        "peak": self.peak,
+                        "max_dd": self.max_dd,
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception:
+            pass
+
+    def open_trade(self, direction, ind):
+        pair = ind["pair"]
+
+        with config_lock:
+            risk_pct = float(CONFIG["risk_per_trade"])
+            leverage = float(CONFIG["leverage"])
+            sl_pips = float(CONFIG["sl_pips"])
+            risk_mult = float(PAIR_CONFIG.get(pair, {}).get("risk_mult", 1.0))
+
+        risk = self.balance * (risk_pct / 100.0) * risk_mult
+        sl_dist, tp_dist = get_sl_tp_distance(pair)
+
+        if direction == 1:
+            sl_price = ind["price"] - sl_dist
+            tp_price = ind["price"] + tp_dist
+        else:
+            sl_price = ind["price"] + sl_dist
+            tp_price = ind["price"] - tp_dist
+
+        lot = risk / (max(sl_pips, 0.00001) * 10.0) * leverage
+        lot = max(0.01, min(float(lot), 1.0))
+
+        pos = {
+            "pair": pair,
+            "direction": int(direction),
+            "entry": float(ind["price"]),
+            "sl": float(sl_price),
+            "tp": float(tp_price),
+            "lot": lot,
+            "risk": float(risk),
+            "time": datetime.now().strftime("%H:%M"),
+            "status": "OPEN",
+        }
+        self.positions.append(pos)
+        return pos
+
+    def check_all_positions(self, prices):
+        closed = []
+        for pos in self.positions[:]:
+            if pos.get("status") != "OPEN":
+                continue
+            pair = pos.get("pair")
+            if pair not in prices:
+                continue
+            price = float(prices[pair])
+
+            with config_lock:
+                sl_pips = float(CONFIG["sl_pips"])
+                tp_pips = float(CONFIG["tp_pips"])
+
+            if pos["direction"] == 1:
+                if price >= float(pos["tp"]):
+                    pnl = float(pos["risk"]) * (tp_pips / sl_pips)
+                    pos["status"] = "WIN"
+                    pos["pnl"] = pnl
+                    self.balance += pnl
+                    closed.append(pos)
+                elif price <= float(pos["sl"]):
+                    pos["status"] = "LOSS"
+                    pos["pnl"] = -float(pos["risk"])
+                    self.balance += float(pos["pnl"])
+                    closed.append(pos)
+            else:
+                if price <= float(pos["tp"]):
+                    pnl = float(pos["risk"]) * (tp_pips / sl_pips)
+                    pos["status"] = "WIN"
+                    pos["pnl"] = pnl
+                    self.balance += pnl
+                    closed.append(pos)
+                elif price >= float(pos["sl"]):
+                    pos["status"] = "LOSS"
+                    pos["pnl"] = -float(pos["risk"])
+                    self.balance += float(pos["pnl"])
+                    closed.append(pos)
+
+        for pos in closed:
+            try:
+                self.positions.remove(pos)
+            except ValueError:
+                pass
+            self.trades.append(pos)
+
+        if closed:
+            self.save_state()
+        return closed
+
+    def stats(self):
+        total = len(self.trades)
+        wins = len([t for t in self.trades if t.get("status") == "WIN"])
+        wr = (wins / total * 100.0) if total > 0 else 0.0
+
+        if self.balance > self.peak:
+            self.peak = self.balance
+
+        dd = ((self.peak - self.balance) / self.peak * 100.0) if self.peak > 0 else 0.0
+        if dd > self.max_dd:
+            self.max_dd = dd
+
+        return {
+            "balance": float(self.balance),
+            "return": ((self.balance / self.initial) - 1) * 100.0,
+            "trades": int(total),
+            "wins": int(wins),
+            "wr": float(wr),
+            "peak": float(self.peak),
+            "max_dd": float(self.max_dd),
+            "open": int(len([p for p in self.positions if p.get("status") == "OPEN"])),
+        }
+
+
+def build_equity_series(initial, trades):
+    labels = ["0"]
+    balances = [float(initial)]
+    bal = float(initial)
+    for i, t in enumerate(trades, start=1):
+        bal += float(t.get("pnl", 0) or 0)
+        labels.append(str(i))
+        balances.append(float(bal))
+    return labels, balances
+
+
+def build_pair_stats(trades):
+    out = {}
+    for t in trades:
+        pair = t.get("pair", "?")
+        out.setdefault(pair, {"trades": 0, "wins": 0, "pnl": 0.0})
+        out[pair]["trades"] += 1
+        if t.get("status") == "WIN":
+            out[pair]["wins"] += 1
+        out[pair]["pnl"] += float(t.get("pnl", 0) or 0)
+    for pair, s in out.items():
+        s["wr"] = (s["wins"] / s["trades"] * 100.0) if s["trades"] else 0.0
+    return out
+
+
+def get_public_config():
+    with config_lock:
+        return {k: CONFIG.get(k) for k in CONFIG_DEFAULTS.keys()}
+
+
+def apply_config_patch(patch):
+    def to_bool(v):
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in ["1", "true", "yes", "y", "on"]:
+            return True
+        if s in ["0", "false", "no", "n", "off"]:
+            return False
+        raise ValueError("auto_trade_enabled must be boolean")
+
+    out = {}
+    if "risk_per_trade" in patch:
+        out["risk_per_trade"] = float(patch["risk_per_trade"])
+        if out["risk_per_trade"] <= 0 or out["risk_per_trade"] > 100:
+            raise ValueError("risk_per_trade must be in (0, 100]")
+    if "trades_per_pair" in patch:
+        out["trades_per_pair"] = int(float(patch["trades_per_pair"]))
+        if out["trades_per_pair"] < 0 or out["trades_per_pair"] > 20:
+            raise ValueError("trades_per_pair must be in [0, 20]")
+    if "sl_pips" in patch:
+        out["sl_pips"] = float(patch["sl_pips"])
+        if out["sl_pips"] <= 0:
+            raise ValueError("sl_pips must be > 0")
+    if "tp_pips" in patch:
+        out["tp_pips"] = float(patch["tp_pips"])
+        if out["tp_pips"] <= 0:
+            raise ValueError("tp_pips must be > 0")
+    if "leverage" in patch:
+        out["leverage"] = float(patch["leverage"])
+        if out["leverage"] <= 0 or out["leverage"] > 1000:
+            raise ValueError("leverage must be in (0, 1000]")
+    if "check_interval" in patch:
+        out["check_interval"] = int(float(patch["check_interval"]))
+        if out["check_interval"] < 5:
+            raise ValueError("check_interval must be >= 5")
+    if "auto_trade_enabled" in patch:
+        out["auto_trade_enabled"] = to_bool(patch["auto_trade_enabled"])
+
+    with config_lock:
+        CONFIG.update(out)
+        save_config(CONFIG)
+
+    return get_public_config()
+
+
+DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>LocalTRBot</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root{--bg:#0b1220;--panel:#0f1a2e;--panel2:#0c1628;--text:#e6edf3;--muted:#9fb0c2;--border:rgba(255,255,255,.10);--accent:#7c3aed}
+    *{box-sizing:border-box}
+    body{margin:20px;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;background:radial-gradient(1200px 700px at 20% -10%,rgba(124,58,237,.22),transparent 55%),radial-gradient(900px 550px at 90% 10%,rgba(34,197,94,.14),transparent 60%),var(--bg);color:var(--text)}
+    .wrap{max-width:1200px;margin:0 auto}
+    .top{display:flex;justify-content:space-between;gap:12px;align-items:flex-end}
+    h1{margin:0;font-size:20px;letter-spacing:.2px}
+    .muted{color:var(--muted);font-size:12px}
+    .grid{display:grid;grid-template-columns:1.6fr 1fr;gap:14px;margin-top:14px}
+    .card{border:1px solid var(--border);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.03));border-radius:14px;padding:14px;box-shadow:0 12px 30px rgba(0,0,0,.22)}
+    .head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:10px}
+    h3{margin:0;font-size:13px;letter-spacing:.2px}
+    input{width:100%;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--panel2);color:var(--text);outline:none}
+    button{padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:rgba(124,58,237,.88);color:#fff;cursor:pointer;font-weight:650}
+    .row{display:flex;gap:10px}
+    .row>div{flex:1}
+    canvas{max-height:340px}
+    pre{margin:0;white-space:pre-wrap;color:var(--muted);font-size:12px}
+    @media (max-width:1100px){.grid{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1>LocalTRBot</h1>
+        <div class="muted">10Y chart + equity (auto-refresh)</div>
+      </div>
+      <div class="muted" id="updated">Updated: —</div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="head"><h3>10Y Daily (Close + EMA50/EMA200)</h3><div class="muted" id="lt_meta">—</div></div>
+        <div class="row" style="margin-bottom:10px">
+          <div style="flex:1.3"><input id="lt_pair" value="BTCUSD" /></div>
+          <div style="flex:.7"><button onclick="loadLong(true)">Load</button></div>
+        </div>
+        <canvas id="lt10y"></canvas>
+      </div>
+
+      <div class="card">
+        <div class="head"><h3>Equity (bot)</h3><div class="muted" id="eq_meta">—</div></div>
+        <canvas id="equity"></canvas>
+        <div style="margin-top:12px">
+          <div class="head" style="margin-bottom:6px"><h3>State</h3><div class="muted">/api/state</div></div>
+          <pre id="stats">Loading...</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+let ltChart, eqChart;
+function fmtMoney(v){const n=Number(v);return Number.isFinite(n)?('$'+n.toFixed(2)):'—'}
+function setText(id, t){const e=document.getElementById(id); if(e) e.textContent=t}
+
+async function loadLong(showMsg){
+  const pair = (document.getElementById('lt_pair')?.value || 'BTCUSD').trim();
+  const u = '/api/longterm?pair=' + encodeURIComponent(pair);
+  const out = await fetch(u).then(r=>r.json());
+  if (!out || out.ok === false){
+    setText('lt_meta', 'Error');
+    return;
+  }
+  setText('lt_meta', `${out.pair} • ${out.labels.length} bars`);
+  const ctx = document.getElementById('lt10y');
+  if (ltChart) ltChart.destroy();
+  ltChart = new Chart(ctx, {
+    type:'line',
+    data:{
+      labels: out.labels,
+      datasets:[
+        {label:'Close', data:out.close, borderColor:'#a78bfa', backgroundColor:'rgba(167,139,250,.12)', fill:true, tension:0.2, pointRadius:0},
+        {label:'EMA50', data:out.ema50, borderColor:'#60a5fa', tension:0.2, pointRadius:0},
+        {label:'EMA200', data:out.ema200, borderColor:'#22c55e', tension:0.2, pointRadius:0}
+      ]
+    },
+    options:{responsive:true, plugins:{legend:{labels:{color:'#9fb0c2'}}}, scales:{x:{ticks:{color:'#9fb0c2'}}, y:{ticks:{color:'#9fb0c2'}, grid:{color:'rgba(255,255,255,.06)'}}}}
+  });
+}
+
+async function loadAll(){
+  const st = await fetch('/api/state').then(r=>r.json());
+  document.getElementById('stats').textContent = JSON.stringify(st, null, 2);
+
+  const eq = await fetch('/api/equity').then(r=>r.json());
+  setText('eq_meta', `Initial ${fmtMoney(eq.balances?.[0])} • Current ${fmtMoney((eq.balances||[]).slice(-1)[0])}`);
+
+  const ctx = document.getElementById('equity');
+  if (eqChart) eqChart.destroy();
+  eqChart = new Chart(ctx, {
+    type:'line',
+    data:{labels:eq.labels, datasets:[{label:'Balance', data:eq.balances, borderColor:'#7c3aed', backgroundColor:'rgba(124,58,237,.15)', fill:true, tension:0.25, pointRadius:0}]},
+    options:{responsive:true, plugins:{legend:{display:false}}, scales:{x:{ticks:{color:'#9fb0c2'}}, y:{ticks:{color:'#9fb0c2'}, grid:{color:'rgba(255,255,255,.06)'}}}}
+  });
+
+  setText('updated', 'Updated: ' + new Date().toLocaleString());
+}
+
+loadAll();
+loadLong(false);
+setInterval(loadAll, 30000);
+</script>
+</body>
+</html>
+"""
+
+bot = telebot.TeleBot(BOT_TOKEN)
+account = Account()
+current_prices = {}
+
+longterm_lock = threading.Lock()
+longterm_cache = {}
+longterm_ttl_sec = 6 * 3600
+
+
+def get_longterm_series(pair_or_ticker):
+    pair = str(pair_or_ticker or "").strip() or "BTCUSD"
+    ticker = PAIRS.get(pair, pair)
+
+    now = time.time()
+    with longterm_lock:
+        cached = longterm_cache.get(ticker)
+        if cached and (now - float(cached.get("ts", 0) or 0) <= longterm_ttl_sec):
+            return cached
+
+    df = yf.download(ticker, period="10y", interval="1d", auto_adjust=True, progress=False)
+    if df is None or df.empty:
+        return None
+
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
+    try:
+        if getattr(df.index, "tz", None) is not None:
+            df.index = df.index.tz_convert(None)
+    except Exception:
+        pass
+
+    df.columns = [str(c).lower().strip() for c in df.columns]
+    if "close" not in df.columns:
+        return None
+
+    df = df.dropna(subset=["close"]).sort_index()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+
+    labels = [d.strftime("%Y-%m-%d") for d in df.index]
+    out = {
+        "ok": True,
+        "pair": pair,
+        "ticker": ticker,
+        "labels": labels,
+        "close": [float(x) for x in df["close"].values],
+        "ema50": [float(x) for x in df["ema50"].values],
+        "ema200": [float(x) for x in df["ema200"].values],
+        "ts": now,
+    }
+
+    with longterm_lock:
+        longterm_cache[ticker] = out
+
+    return out
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    def _send(self, code, content_type, body_bytes):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
+    def _send_json(self, code, obj):
+        b = json.dumps(obj).encode("utf-8")
+        self._send(code, "application/json; charset=utf-8", b)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        path = u.path
+        qs = parse_qs(u.query or "")
+
+        if path == "/" or path.startswith("/?"):
+            self._send(200, "text/html; charset=utf-8", DASHBOARD_HTML.encode("utf-8"))
+            return
+
+        if path == "/api/longterm":
+            pair = (qs.get("pair", [""])[0] or "").strip() or (qs.get("t", [""])[0] or "").strip() or "BTCUSD"
+            out = get_longterm_series(pair)
+            if not out:
+                self._send_json(400, {"ok": False, "error": "no data"})
+            else:
+                self._send_json(200, out)
+            return
+
+        if path == "/api/state":
+            st = account.stats()
+            self._send_json(
+                200,
+                {
+                    "stats": st,
+                    "config": get_public_config(),
+                    "pair_stats": build_pair_stats(account.trades),
+                    "open_positions": [p for p in account.positions if p.get("status") == "OPEN"],
+                    "last_trades": list(reversed(account.trades[-20:])),
+                },
+            )
+            return
+
+        if path == "/api/equity":
+            labels, balances = build_equity_series(account.initial, account.trades)
+            self._send_json(200, {"labels": labels, "balances": balances})
+            return
+
+        self._send_json(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        if u.path != "/api/config":
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+
+        try:
+            n = int(self.headers.get("Content-Length", "0") or 0)
+            raw = self.rfile.read(n)
+            payload = json.loads(raw.decode("utf-8") or "{}")
+            if not isinstance(payload, dict):
+                raise ValueError("payload must be object")
+            cfg = apply_config_patch(payload)
+            self._send_json(200, {"ok": True, "config": cfg})
+        except Exception as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+
+
+def notify(text):
+    try:
+        bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+def fp(pair, ind):
+    return fmt_price(pair, ind["price"])
+
+
+@bot.message_handler(commands=["start"])
+def start(m):
+    bot.reply_to(
+        m,
+        "MULTI-PAIRS BOT\n"
+        "=====================\n\n"
+        "Pairs: BTCUSD, ETHUSD, USDJPY, EURJPY, EURUSD, GBPUSD, EURGBP\n\n"
+        "Commands:\n"
+        "/signal - All signals\n"
+        "/trade - Best trade\n"
+        "/status - Account\n"
+        "/market - Market data\n"
+        "/stats - Performance\n"
+        "/dashboard - Dashboard\n",
+    )
+
+
+@bot.message_handler(commands=["market"])
+def market(m):
+    text = "<b>Market Data:</b>\n\n"
+    for pair, ticker in PAIRS.items():
+        d = get_data(ticker)
+        if d is None or d.empty:
+            text += f"{pair}: N/A\n"
+            continue
+        ind = get_indicators(d, pair)
+        emoji = "UP" if ind["change"] > 0 else "DOWN"
+        text += f"{pair}: {fp(pair, ind)} ({emoji} {ind['change']:+.2f}%) RSI:{ind['rsi']:.0f}\n"
+    bot.reply_to(m, text, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["signal"])
+def signal(m):
+    text = "<b>Signals:</b>\n\n"
+    best = None
+    best_count = 0
+
+    for pair, ticker in PAIRS.items():
+        d = get_data(ticker)
+        if d is None or d.empty:
+            continue
+        ind = get_indicators(d, pair)
+        sig, sigs = check_signal(ind, enforce_hours=False)
+
+        if sig != 0:
+            direction = "BUY" if sig == 1 else "SELL"
+            text += f"{pair}: <b>{direction}</b> RSI:{ind['rsi']:.0f}\n"
+            if len(sigs) > best_count:
+                best_count = len(sigs)
+                best = (pair, sig, ind, sigs)
+
+    if best:
+        pair, sig, ind, sigs = best
+        text += f"\n<b>BEST: {pair}</b>\n"
+        text += f"Entry: {fp(pair, ind)}\n"
+
+    bot.reply_to(m, text if ("BUY" in text or "SELL" in text) else "No signals.", parse_mode="HTML")
+
+
+@bot.message_handler(commands=["trade"])
+def trade(m):
+    best = None
+    best_count = 0
+
+    with config_lock:
+        max_per_pair = int(CONFIG["trades_per_pair"])
+
+    for pair, ticker in PAIRS.items():
+        if len([p for p in account.positions if p.get("pair") == pair and p.get("status") == "OPEN"]) >= max_per_pair:
+            continue
+        d = get_data(ticker)
+        if d is None or d.empty:
+            continue
+        ind = get_indicators(d, pair)
+        sig, sigs = check_signal(ind, enforce_hours=False)
+        if sig != 0 and len(sigs) > best_count:
+            best_count = len(sigs)
+            best = (pair, sig, ind, sigs)
+
+    if best is None:
+        bot.reply_to(m, "No signals!")
+        return
+
+    pair, sig, ind, sigs = best
+    pos = account.open_trade(sig, ind)
+    direction = "LONG" if sig == 1 else "SHORT"
+
+    notify(
+        f"TRADE [{direction}]\n\n"
+        f"Pair: {pair}\n"
+        f"Entry: {fp(pair, ind)}\n\n"
+        "Signals:\n" + "\n".join(f"- {s}" for s in sigs)
+    )
+
+    msg = (
+        f"TRADE [{direction}]\n\n"
+        f"Pair: {pair}\n"
+        f"Entry: {fp(pair, ind)}\n"
+        f"SL: {fmt_price(pair, pos['sl'])}\n"
+        f"TP: {fmt_price(pair, pos['tp'])}\n"
+        f"Risk: ${pos['risk']:.2f}\n\n"
+        f"Balance: ${account.balance:.2f}"
+    )
+    bot.reply_to(m, msg)
+
+
+@bot.message_handler(commands=["status"])
+def status(m):
+    st = account.stats()
+    open_pos = "\n".join(
+        f"- {p['pair']} {'LONG' if p['direction']==1 else 'SHORT'}"
+        for p in account.positions
+        if p.get("status") == "OPEN"
+    )
+
+    msg = (
+        "Account\n"
+        "========\n\n"
+        f"Balance: ${st['balance']:.2f}\n"
+        f"Return: {st['return']:+.2f}%\n\n"
+        f"Trades: {st['trades']} | WR: {st['wr']:.1f}%\n"
+        f"Open: {st['open']}\n"
+        f"{open_pos if open_pos else '(none)'}\n\n"
+        f"Peak: ${st['peak']:.2f}\n"
+        f"Max DD: {st['max_dd']:.2f}%"
+    )
+    bot.reply_to(m, msg)
+
+
+@bot.message_handler(commands=["stats"])
+def stats_cmd(m):
+    st = account.stats()
+    msg = (
+        "Stats\n"
+        "=====\n\n"
+        f"Balance: ${st['balance']:.2f}\n"
+        f"Return: {st['return']:+.2f}%\n"
+        f"Trades: {st['trades']}\n"
+        f"Win Rate: {st['wr']:.1f}%"
+    )
+    bot.reply_to(m, msg)
+
+
+@bot.message_handler(commands=["dashboard"])
+def dashboard_cmd(m):
+    st = account.stats()
+
+    last_trades = account.trades[-5:]
+    last_text = "\n".join(
+        f"- {t.get('pair','?')} {('LONG' if t.get('direction')==1 else 'SHORT')} {t.get('status','?')} ${float(t.get('pnl', 0) or 0):+.2f}"
+        for t in reversed(last_trades)
+    )
+
+    open_text = "\n".join(
+        f"- {p['pair']} {('LONG' if p['direction']==1 else 'SHORT')} Entry:{fmt_price(p['pair'], p['entry'])} SL:{fmt_price(p['pair'], p['sl'])} TP:{fmt_price(p['pair'], p['tp'])}"
+        for p in account.positions
+        if p.get("status") == "OPEN"
+    )
+
+    bot.reply_to(
+        m,
+        "<b>DASHBOARD</b>\n\n"
+        f"Balance: ${st['balance']:.2f}\n"
+        f"Return: {st['return']:+.2f}%\n"
+        f"Trades: {st['trades']} | WR: {st['wr']:.1f}%\n"
+        f"Peak: ${st['peak']:.2f}\n"
+        f"Max DD: {st['max_dd']:.2f}%\n"
+        f"Open: {st['open']}\n\n"
+        f"<b>Open Positions</b>\n{open_text if open_text else '(none)'}\n\n"
+        f"<b>Last 5 Trades</b>\n{last_text if last_text else '(none)'}\n\n"
+        "Web dashboard: / (HTTP)",
+        parse_mode="HTML",
+    )
+
+
+def auto_trade():
+    while True:
+        try:
+            now = datetime.now()
+            prices = {}
+
+            for pair, ticker in PAIRS.items():
+                d = get_data(ticker)
+                if d is None or d.empty:
+                    continue
+                ind = get_indicators(d, pair)
+                prices[pair] = float(ind["price"])
+                current_prices[pair] = ind
+
+            if prices and any(p.get("status") == "OPEN" for p in account.positions):
+                closed = account.check_all_positions(prices)
+                if closed:
+                    text = "<b>CLOSED:</b>\n"
+                    for pos in closed:
+                        text += f"{pos.get('pair','?')}: {pos.get('status','?')} ${float(pos.get('pnl', 0) or 0):+.2f}\n"
+                    notify(text)
+
+            with config_lock:
+                enabled = bool(CONFIG.get("auto_trade_enabled", True))
+                trades_per_pair = int(CONFIG["trades_per_pair"])
+                interval = int(CONFIG["check_interval"])
+
+            for pair, ticker in PAIRS.items():
+                if not enabled:
+                    break
+                if len([p for p in account.positions if p.get("pair") == pair and p.get("status") == "OPEN"]) >= trades_per_pair:
+                    continue
+                d = get_data(ticker)
+                if d is None or d.empty:
+                    continue
+                ind = get_indicators(d, pair)
+
+                sig, sigs = check_signal(ind, enforce_hours=True)
+                if sig != 0 and len(sigs) >= 2:
+                    pos = account.open_trade(sig, ind)
+                    account.save_state()
+                    direction = "LONG" if sig == 1 else "SHORT"
+                    notify(
+                        f"AUTO [{direction}]\n\n"
+                        f"Pair: {pair}\n"
+                        f"Entry: {fp(pair, ind)}\n\n" + "\n".join(f"- {s}" for s in sigs)
+                    )
+
+            if (now - account.last_report).seconds >= 3600:
+                st = account.stats()
+                text = f"<b>HOURLY</b>\n\nBalance: ${st['balance']:.2f}\nReturn: {st['return']:+.2f}%\nOpen: {st['open']}\n"
+                if any(p.get("status") == "OPEN" for p in account.positions):
+                    text += "\nPositions:\n"
+                    for p in account.positions:
+                        if p.get("status") == "OPEN":
+                            text += f"- {p.get('pair','?')}\n"
+                notify(text)
+                account.last_report = now
+                account.save_state()
+
+            time.sleep(max(1, interval))
+
+        except Exception:
+            time.sleep(60)
+
+
+def run_bot_polling():
+    try:
+        bot.polling(none_stop=True)
+    except Exception:
+        pass
+
+
+def run_http_server():
+    port = int(os.environ.get("PORT", "8080") or 8080)
+    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
+    server.serve_forever()
+
+
+def main():
+    t1 = threading.Thread(target=auto_trade, daemon=True)
+    t1.start()
+
+    t2 = threading.Thread(target=run_bot_polling, daemon=True)
+    t2.start()
+
+    run_http_server()
+
+
+if __name__ == "__main__":
+    main()
