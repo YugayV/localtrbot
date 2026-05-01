@@ -474,6 +474,7 @@ DASHBOARD_HTML = """<!doctype html>
 <body>
   <h2>LocalTRBot Dashboard</h2>
   <div class=\"muted\">Bot + Dashboard running as one service (Railway-friendly).</div>
+  <div class=\"muted\" id=\"page_error\" style=\"margin-top:8px;color:#d1242f\"></div>
 
   <div class=\"grid\" style=\"margin-top:16px\">
     <div class=\"card\"><h3>Equity</h3><canvas id=\"equity\"></canvas></div>
@@ -755,9 +756,11 @@ async function loadHistory(pair){
 }
 
 async function loadAll(){
-  const st = await fetch('/api/state').then(r=>r.json());
-  const statsEl = document.getElementById('stats');
-  if (statsEl) statsEl.textContent = JSON.stringify(st, null, 2);
+  try{
+    setText('page_error', '');
+    const st = await fetch('/api/state').then(r=>r.json());
+    const statsEl = document.getElementById('stats');
+    if (statsEl) statsEl.textContent = JSON.stringify(st, null, 2);
 
   const posEl = document.getElementById('stats_positions');
   if (posEl) posEl.textContent = JSON.stringify(st.open_positions || [], null, 2);
@@ -810,13 +813,16 @@ async function loadAll(){
     options: { responsive:true, plugins:{legend:{display:true}} }
   });
 
-  const ctx2 = document.getElementById('wl');
-  if (wlChart) wlChart.destroy();
-  wlChart = new Chart(ctx2, {
-    type:'doughnut',
-    data:{ labels:['WIN','LOSS'], datasets:[{ data:[st.stats.wins, st.stats.trades - st.stats.wins], backgroundColor:['#1a7f37','#d1242f'] }]},
-    options:{ responsive:true }
-  });
+    const ctx2 = document.getElementById('wl');
+    if (wlChart) wlChart.destroy();
+    wlChart = new Chart(ctx2, {
+      type:'doughnut',
+      data:{ labels:['WIN','LOSS'], datasets:[{ data:[st.stats.wins, st.stats.trades - st.stats.wins], backgroundColor:['#1a7f37','#d1242f'] }]},
+      options:{ responsive:true }
+    });
+  }catch(e){
+    setText('page_error', 'Dashboard error: ' + (e?.message || String(e)));
+  }
 }
 
 async function saveCfg(){
@@ -830,8 +836,21 @@ async function saveCfg(){
   await loadAll();
 }
 
-loadAll();
-setInterval(loadAll, 15000);
+function safeLoadAll(){
+  loadAll().catch(e => setText('page_error', 'Dashboard error: ' + (e?.message || String(e))));
+}
+
+window.addEventListener('error', (e) => {
+  const msg = (e && e.message) ? e.message : 'script error';
+  setText('page_error', 'Dashboard error: ' + msg);
+});
+window.addEventListener('unhandledrejection', (e) => {
+  const msg = (e && e.reason && e.reason.message) ? e.reason.message : String(e.reason || 'promise rejection');
+  setText('page_error', 'Dashboard error: ' + msg);
+});
+
+safeLoadAll();
+setInterval(safeLoadAll, 15000);
 </script>
 </body>
 </html>"""
