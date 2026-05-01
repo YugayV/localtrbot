@@ -117,7 +117,7 @@ PAIRS = {
     "LINKUSD": "LINK-USD",
     "DOTUSD": "DOT-USD",
     "LTCUSD": "LTC-USD",
-    "MATICUSD": "MATIC-USD",
+    "MATICUSD": "POL-USD",
 
     "USDJPY": "USDJPY=X",  # 40% WR, +$141
     "EURJPY": "EURJPY=X",  # 37% WR, +$96

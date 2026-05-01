@@ -117,7 +117,7 @@ with col_right:
     check_interval = st.number_input("Check interval (sec)", min_value=5, value=int(cfg["check_interval"]), step=5)
     auto_trade_enabled = st.selectbox("Auto-trade enabled", ["true", "false"], index=0 if bool(cfg["auto_trade_enabled"]) else 1)
 
-    if st.button("Save settings", use_container_width=True):
+    if st.button("Save settings", use_container_width=True, width="stretch"):
         botmod.apply_config_patch(
             {
                 "risk_per_trade": risk_per_trade,
@@ -198,12 +198,12 @@ with col_left:
         fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers+text", text=texts, textposition="top center", name="Waves"))
 
     fig.update_layout(height=650, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Open Positions")
-        st.dataframe(_get_positions_df(), use_container_width=True, hide_index=True)
+        st.dataframe(_get_positions_df(), width="stretch", hide_index=True)
     with c2:
         st.subheader("Last Trades")
-        st.dataframe(_get_trades_df(), use_container_width=True, hide_index=True)
+        st.dataframe(_get_trades_df(), width="stretch", hide_index=True)
