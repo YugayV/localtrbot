@@ -19,6 +19,8 @@ import json
 import os
 import contextlib
 import io
+import urllib.request
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -142,6 +144,253 @@ def get_seoul_time():
     return datetime.now(timezone(timedelta(hours=9)))
 
 GOOD_HOURS = [5, 7, 8, 18, 19]
+
+DATA_DIR = os.path.join(BASE_DIR, "data")
+MODEL_DIR = os.path.join(BASE_DIR, "models")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+BYBIT_SYMBOLS = {
+    "BTCUSD": "BTCUSDT",
+    "ETHUSD": "ETHUSDT",
+    "SOLUSD": "SOLUSDT",
+    "XRPUSD": "XRPUSDT",
+    "BNBUSD": "BNBUSDT",
+    "ADAUSD": "ADAUSDT",
+    "DOGEUSD": "DOGEUSDT",
+    "AVAXUSD": "AVAXUSDT",
+    "LINKUSD": "LINKUSDT",
+    "DOTUSD": "DOTUSDT",
+    "LTCUSD": "LTCUSDT",
+    "MATICUSD": "POLUSDT",
+}
+
+
+def _bybit_kline(pair, interval_min, limit=1000, end_ms=None, category="linear"):
+    sym = BYBIT_SYMBOLS.get(pair)
+    if not sym:
+        return None
+
+    q = f"category={category}&symbol={sym}&interval={int(interval_min)}&limit={int(limit)}"
+    if end_ms is not None:
+        q += f"&end={int(end_ms)}"
+
+    url = f"https://api.bybit.com/v5/market/kline?{q}"
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read().decode("utf-8", errors="ignore")
+        payload = json.loads(raw)
+        if str(payload.get("retCode")) != "0":
+            return None
+        lst = (payload.get("result") or {}).get("list") or []
+        if not lst:
+            return None
+
+        rows = []
+        for it in lst:
+            try:
+                ts = int(it[0])
+                o = float(it[1])
+                h = float(it[2])
+                l = float(it[3])
+                c = float(it[4])
+                v = float(it[5])
+            except Exception:
+                continue
+            rows.append((ts, o, h, l, c, v))
+
+        if not rows:
+            return None
+
+        rows.sort(key=lambda x: x[0])
+        df = pd.DataFrame(rows, columns=["ts", "Open", "High", "Low", "Close", "Volume"]) 
+        df["Datetime"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df = df.set_index("Datetime")
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+    except Exception:
+        return None
+
+
+def update_market_data(pair, tf="15m", bars=3000):
+    tf_norm = tf.lower().strip()
+    path = os.path.join(DATA_DIR, f"{pair}_{tf_norm}.csv")
+
+    df_new = None
+
+    if pair in CRYPTO_PAIRS and tf_norm in ["15m", "1h"]:
+        interval_min = 15 if tf_norm == "15m" else 60
+        need = int(bars)
+        parts = []
+        end_ms = None
+        while need > 0 and len(parts) < 10:
+            batch = min(1000, need)
+            chunk = _bybit_kline(pair, interval_min, limit=batch, end_ms=end_ms)
+            if chunk is None or chunk.empty:
+                break
+            parts.append(chunk)
+            end_ms = int(chunk.index[0].value / 1_000_000) - 1
+            need -= len(chunk)
+        if parts:
+            df_new = pd.concat(parts).sort_index()
+            df_new = df_new[~df_new.index.duplicated(keep="last")]
+    else:
+        ticker = PAIRS.get(pair)
+        if ticker is not None:
+            df_new = get_history(pair, tf=tf_norm)[0]
+
+    if df_new is None or df_new.empty:
+        return None
+
+    df_all = df_new
+    if os.path.exists(path):
+        try:
+            old = pd.read_csv(path, parse_dates=["Datetime"])
+            old = old.set_index("Datetime")
+            df_all = pd.concat([old, df_new]).sort_index()
+            df_all = df_all[~df_all.index.duplicated(keep="last")]
+        except Exception:
+            df_all = df_new
+
+    try:
+        out = df_all.copy()
+        out = out.reset_index()
+        out.to_csv(path, index=False)
+    except Exception:
+        pass
+
+    return df_all
+
+
+def train_direction_model(pair, tf="15m", bars=5000, lr=0.2, epochs=250, l2=1e-4):
+    df = update_market_data(pair, tf=tf, bars=bars)
+    if df is None or df.empty or len(df) < 200:
+        return None
+
+    close = df["Close"].astype(float)
+    ret1 = close.pct_change()
+    vol = ret1.rolling(20).std()
+    sma20 = close.rolling(20).mean()
+
+    deltas = close.diff()
+    gains = deltas.clip(lower=0)
+    losses = (-deltas).clip(lower=0)
+    avg_gain = gains.rolling(14).mean()
+    avg_loss = losses.rolling(14).mean().replace(0, 1e-9)
+    rsi = 100 - (100 / (1 + (avg_gain / avg_loss)))
+
+    x = pd.DataFrame(
+        {
+            "ret1": ret1,
+            "vol20": vol,
+            "sma_dist": (close - sma20) / sma20,
+            "rsi14": rsi / 100.0,
+        },
+        index=df.index,
+    ).dropna()
+
+    y = (close.shift(-1).reindex(x.index) > close.reindex(x.index)).astype(int).values
+    x = x.values.astype(float)
+
+    n = len(x)
+    if n < 200:
+        return None
+
+    split = int(n * 0.8)
+    x_train, x_test = x[:split], x[split:]
+    y_train, y_test = y[:split], y[split:]
+
+    mu = x_train.mean(axis=0)
+    sd = x_train.std(axis=0)
+    sd[sd == 0] = 1.0
+
+    x_train = (x_train - mu) / sd
+    x_test = (x_test - mu) / sd
+
+    x_train = np.concatenate([np.ones((len(x_train), 1)), x_train], axis=1)
+    x_test = np.concatenate([np.ones((len(x_test), 1)), x_test], axis=1)
+
+    w = np.zeros(x_train.shape[1], dtype=float)
+
+    def _sig(z):
+        z = np.clip(z, -30, 30)
+        return 1.0 / (1.0 + np.exp(-z))
+
+    for _ in range(int(epochs)):
+        p = _sig(x_train @ w)
+        grad = (x_train.T @ (p - y_train)) / len(y_train)
+        grad[1:] += l2 * w[1:]
+        w -= float(lr) * grad
+
+    p_test = _sig(x_test @ w)
+    pred = (p_test >= 0.5).astype(int)
+    acc = float((pred == y_test).mean()) if len(y_test) else 0.0
+
+    model = {
+        "pair": pair,
+        "tf": tf,
+        "type": "logreg",
+        "feature_names": ["bias", "ret1", "vol20", "sma_dist", "rsi14"],
+        "mu": mu.tolist(),
+        "sd": sd.tolist(),
+        "w": w.tolist(),
+        "metrics": {"acc": acc, "n": int(n)},
+        "trained_at": int(time.time()),
+    }
+
+    try:
+        with open(os.path.join(MODEL_DIR, f"{pair}_{tf_norm}_logreg.json"), "w", encoding="utf-8") as f:
+            json.dump(model, f)
+    except Exception:
+        pass
+
+    return model
+
+
+def load_direction_model(pair, tf="15m"):
+    tf_norm = tf.lower().strip()
+    path = os.path.join(MODEL_DIR, f"{pair}_{tf_norm}_logreg.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def predict_direction_proba(df, model):
+    try:
+        close = df["Close"].astype(float)
+        ret1 = float(close.pct_change().iloc[-1])
+        vol20 = float(close.pct_change().rolling(20).std().iloc[-1])
+        sma20 = float(close.rolling(20).mean().iloc[-1])
+        sma_dist = float((close.iloc[-1] - sma20) / sma20) if sma20 else 0.0
+
+        deltas = close.diff()
+        gains = deltas.clip(lower=0)
+        losses = (-deltas).clip(lower=0)
+        avg_gain = float(gains.rolling(14).mean().iloc[-1])
+        avg_loss = float(losses.rolling(14).mean().iloc[-1])
+        if avg_loss <= 0:
+            avg_loss = 1e-9
+        rsi14 = (100 - (100 / (1 + (avg_gain / avg_loss)))) / 100.0
+
+        mu = np.array(model.get("mu") or [], dtype=float)
+        sd = np.array(model.get("sd") or [], dtype=float)
+        w = np.array(model.get("w") or [], dtype=float)
+        if len(mu) != 4 or len(sd) != 4 or len(w) != 5:
+            return None
+
+        x = np.array([ret1, vol20, sma_dist, rsi14], dtype=float)
+        x = (x - mu) / sd
+        x = np.concatenate([[1.0], x])
+        z = float(np.clip(x @ w, -30, 30))
+        return float(1.0 / (1.0 + np.exp(-z)))
+    except Exception:
+        return None
+
 
 
 def fmt_price(pair, price):
@@ -309,8 +558,12 @@ def check_signal(ind, enforce_hours=True):
 
 
 def get_intraday_signal(pair, ticker, enforce_hours=True):
-    d15 = get_data(ticker, period="5d", interval="15m")
-    d1h = get_data(ticker, period="60d", interval="1h")
+    if pair in CRYPTO_PAIRS:
+        d15 = _bybit_kline(pair, 15, limit=600)
+        d1h = _bybit_kline(pair, 60, limit=800)
+    else:
+        d15 = get_data(ticker, period="5d", interval="15m")
+        d1h = get_data(ticker, period="60d", interval="1h")
 
     if d15 is None or d15.empty or d1h is None or d1h.empty:
         return 0, ["No data"], None, None
@@ -357,6 +610,21 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
             if sig15 == -1 and float(ind15.get('price')) > prev_low:
                 reasons.append("Filter: no 20-bar breakdown")
                 sig = 0
+    except Exception:
+        pass
+
+    try:
+        model = load_direction_model(pair, tf="15m")
+        if model is not None:
+            p_up = predict_direction_proba(d15, model)
+            if p_up is not None:
+                reasons.append(f"Model p(up)={p_up:.2f} acc={float((model.get('metrics') or {}).get('acc') or 0):.2f}")
+                if sig == 1 and p_up < 0.55:
+                    reasons.append("Filter: model p(up) < 0.55")
+                    sig = 0
+                if sig == -1 and p_up > 0.45:
+                    reasons.append("Filter: model p(up) > 0.45")
+                    sig = 0
     except Exception:
         pass
 
