@@ -25,14 +25,18 @@ def _start_background():
         botmod.run_bot_polling()
 
     def _run_data_updater():
+        print("[DATA] updater started")
         while True:
             try:
-                for p in list(botmod.PAIRS.keys()):
+                n = 0
+                for p in sorted(list(getattr(botmod, "CRYPTO_PAIRS", []) or [])):
                     botmod.update_market_data(p, tf="15m", bars=1500, min_age_sec=180)
                     botmod.update_market_data(p, tf="1h", bars=2000, min_age_sec=300)
-                    time.sleep(0.2)
-            except Exception:
-                pass
+                    n += 1
+                    time.sleep(0.1)
+                print(f"[DATA] updater cycle ok pairs={n}")
+            except Exception as e:
+                print(f"[DATA] updater error: {e}")
             time.sleep(30)
 
     t1 = threading.Thread(target=_run_auto, daemon=True)

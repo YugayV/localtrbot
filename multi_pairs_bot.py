@@ -1456,6 +1456,16 @@ def get_history(pair, tf="1d"):
 
     period, interval, tf_norm = _history_params(tf)
     ticker = PAIRS[pair]
+
+    if pair in CRYPTO_PAIRS and tf_norm in ["15m", "1h"]:
+        df = update_market_data(pair, tf=tf_norm, bars=3000, min_age_sec=60 if tf_norm == "15m" else 180)
+        if df is None or df.empty or len(df) < 50:
+            raise ValueError("no data")
+        return df, tf_norm
+
+    if isinstance(ticker, (list, tuple, set)):
+        ticker = list(ticker)[0] if ticker else ""
+
     now = time.time()
     key = _history_key(ticker, tf_norm)
 
@@ -1903,6 +1913,9 @@ def auto_trade():
                 enabled = bool(CONFIG.get("auto_trade_enabled", True))
                 trades_per_pair = int(CONFIG["trades_per_pair"])
 
+            candidates = 0
+            sample = None
+
             for pair, ticker in PAIRS.items():
                 if len([p for p in account.positions if p['pair'] == pair]) >= trades_per_pair:
                     continue
@@ -1910,6 +1923,11 @@ def auto_trade():
                     continue
 
                 sig, sigs, ind15, ind1h = get_intraday_signal(pair, ticker, enforce_hours=False)
+                if sig != 0 and ind15 is not None:
+                    candidates += 1
+                    if sample is None:
+                        sample = (pair, sig, list(sigs)[:6])
+
                 if sig == 0 or ind15 is None:
                     continue
 
@@ -1936,6 +1954,16 @@ def auto_trade():
                 account.save_state()
             
             RUNTIME["auto_trade_last_cycle_ts"] = time.time()
+
+            try:
+                open_cnt = len([p for p in account.positions if p.get("status") == "OPEN"])
+                msg = f"[AUTO] enabled={enabled} open={open_cnt} candidates={candidates}"
+                if sample is not None:
+                    p, s, rs = sample
+                    msg += f" sample={p} {'BUY' if s==1 else 'SELL'}: " + ", ".join(rs)
+                print(msg)
+            except Exception:
+                pass
 
             with config_lock:
                 interval = int(CONFIG["check_interval"])
