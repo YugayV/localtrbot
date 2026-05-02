@@ -161,6 +161,34 @@ with col_right:
         )
         st.success("Saved")
 
+    with st.expander("Data & Model", expanded=False):
+        st.caption("Скачивает данные в ./data и сохраняет модель в ./models (в Railway хранилище может быть временным)")
+
+        pair_dm = st.selectbox("Pair", list(botmod.PAIRS.keys()), key="dm_pair")
+        tf_dm = st.selectbox("TF", ["15m", "1h", "1d", "1wk"], key="dm_tf")
+
+        if st.button("Update data", width="stretch"):
+            try:
+                df_u = botmod.update_market_data(pair_dm, tf=tf_dm, bars=3000)
+                if df_u is None or df_u.empty:
+                    st.error("No data downloaded")
+                else:
+                    st.success(f"OK: {len(df_u)} rows")
+            except Exception as e:
+                st.error(f"Update error: {e}")
+
+        if st.button("Train 15m model", width="stretch"):
+            try:
+                m = botmod.train_direction_model(pair_dm, tf="15m", bars=5000)
+                if not m:
+                    st.error("Training failed (not enough data)")
+                else:
+                    acc = float((m.get("metrics") or {}).get("acc") or 0)
+                    n = int((m.get("metrics") or {}).get("n") or 0)
+                    st.success(f"Trained: acc={acc:.2f} n={n}")
+            except Exception as e:
+                st.error(f"Train error: {e}")
+
     st.divider()
     st.subheader("Account")
     st.write(botmod.account.stats())

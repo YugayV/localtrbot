@@ -264,7 +264,8 @@ def update_market_data(pair, tf="15m", bars=3000):
 
 
 def train_direction_model(pair, tf="15m", bars=5000, lr=0.2, epochs=250, l2=1e-4):
-    df = update_market_data(pair, tf=tf, bars=bars)
+    tf_norm = str(tf).lower().strip()
+    df = update_market_data(pair, tf=tf_norm, bars=bars)
     if df is None or df.empty or len(df) < 200:
         return None
 
