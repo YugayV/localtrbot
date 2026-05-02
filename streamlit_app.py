@@ -24,13 +24,27 @@ def _start_background():
             pass
         botmod.run_bot_polling()
 
+    def _run_data_updater():
+        while True:
+            try:
+                for p in list(botmod.PAIRS.keys()):
+                    botmod.update_market_data(p, tf="15m", bars=1500, min_age_sec=180)
+                    botmod.update_market_data(p, tf="1h", bars=2000, min_age_sec=300)
+                    time.sleep(0.2)
+            except Exception:
+                pass
+            time.sleep(30)
+
     t1 = threading.Thread(target=_run_auto, daemon=True)
     t1.start()
 
     t2 = threading.Thread(target=_run_poll, daemon=True)
     t2.start()
 
-    return {"started_at": time.time(), "auto_thread": t1, "poll_thread": t2}
+    t3 = threading.Thread(target=_run_data_updater, daemon=True)
+    t3.start()
+
+    return {"started_at": time.time(), "auto_thread": t1, "poll_thread": t2, "data_thread": t3}
 
 
 def _get_positions_df():
@@ -116,10 +130,11 @@ if st.button("Refresh data", width="stretch"):
 
 auto_alive = bool(bg.get("auto_thread")) and bg["auto_thread"].is_alive()
 poll_alive = bool(bg.get("poll_thread")) and bg["poll_thread"].is_alive()
+data_alive = bool(bg.get("data_thread")) and bg["data_thread"].is_alive()
 rt = getattr(botmod, "RUNTIME", {}) or {}
 
 st.caption(
-    f"Background: auto={auto_alive} polling={poll_alive} | "
+    f"Background: auto={auto_alive} polling={poll_alive} data={data_alive} | "
     f"last_loop={_fmt_ts(rt.get('auto_trade_last_loop_ts'))} | "
     f"last_cycle={_fmt_ts(rt.get('auto_trade_last_cycle_ts'))} | "
     f"last_open={_fmt_ts(rt.get('auto_trade_last_open_ts'))} {rt.get('auto_trade_last_open_pair') or ''}"

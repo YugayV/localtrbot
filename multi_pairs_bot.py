@@ -64,7 +64,7 @@ CONFIG_DEFAULTS = {
     "leverage": 10,
     "sl_pips": 100,
     "tp_pips": 300,
-    "check_interval": 120,
+    "check_interval": 60,
     "auto_trade_enabled": True,
 }
 
@@ -213,9 +213,18 @@ def _bybit_kline(pair, interval_min, limit=1000, end_ms=None, category="linear")
         return None
 
 
-def update_market_data(pair, tf="15m", bars=3000):
+def update_market_data(pair, tf="15m", bars=3000, min_age_sec=300):
     tf_norm = tf.lower().strip()
     path = os.path.join(DATA_DIR, f"{pair}_{tf_norm}.csv")
+
+    try:
+        if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < int(min_age_sec):
+            cached = pd.read_csv(path, parse_dates=["Datetime"])
+            cached = cached.set_index("Datetime")
+            if not cached.empty:
+                return cached
+    except Exception:
+        pass
 
     df_new = None
 
@@ -560,8 +569,12 @@ def check_signal(ind, enforce_hours=True):
 
 def get_intraday_signal(pair, ticker, enforce_hours=True):
     if pair in CRYPTO_PAIRS:
-        d15 = _bybit_kline(pair, 15, limit=600)
-        d1h = _bybit_kline(pair, 60, limit=800)
+        d15 = update_market_data(pair, tf="15m", bars=1200, min_age_sec=60)
+        d1h = update_market_data(pair, tf="1h", bars=2000, min_age_sec=180)
+        if d15 is not None and not d15.empty:
+            d15 = d15.tail(600)
+        if d1h is not None and not d1h.empty:
+            d1h = d1h.tail(800)
     else:
         d15 = get_data(ticker, period="5d", interval="15m")
         d1h = get_data(ticker, period="60d", interval="1h")
@@ -593,23 +606,27 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
         reasons.append("Filter: 1h trend not DOWN")
         sig = 0
 
-    if sig15 == 1 and float(ind1h.get('rsi', 50) or 50) < 50:
-        reasons.append("Filter: 1h RSI < 50")
+    if sig15 == 1 and float(ind1h.get('rsi', 50) or 50) < 48:
+        reasons.append("Filter: 1h RSI < 48")
         sig = 0
-    if sig15 == -1 and float(ind1h.get('rsi', 50) or 50) > 50:
-        reasons.append("Filter: 1h RSI > 50")
+    if sig15 == -1 and float(ind1h.get('rsi', 50) or 50) > 52:
+        reasons.append("Filter: 1h RSI > 52")
         sig = 0
 
     try:
-        lookback = 20
+        lookback = 10
         if len(d15) > lookback + 2:
             prev_high = float(d15['High'].iloc[-(lookback + 1):-1].max())
             prev_low = float(d15['Low'].iloc[-(lookback + 1):-1].min())
-            if sig15 == 1 and float(ind15.get('price')) < prev_high:
-                reasons.append("Filter: no 20-bar breakout")
+
+            strong_up = any("Strong Up" in s or "Proxy UP" in s for s in reasons)
+            strong_dn = any("Strong Down" in s or "Proxy DOWN" in s for s in reasons)
+
+            if sig15 == 1 and float(ind15.get('price')) < prev_high and not strong_up:
+                reasons.append("Filter: no 10-bar breakout")
                 sig = 0
-            if sig15 == -1 and float(ind15.get('price')) > prev_low:
-                reasons.append("Filter: no 20-bar breakdown")
+            if sig15 == -1 and float(ind15.get('price')) > prev_low and not strong_dn:
+                reasons.append("Filter: no 10-bar breakdown")
                 sig = 0
     except Exception:
         pass
@@ -620,11 +637,11 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
             p_up = predict_direction_proba(d15, model)
             if p_up is not None:
                 reasons.append(f"Model p(up)={p_up:.2f} acc={float((model.get('metrics') or {}).get('acc') or 0):.2f}")
-                if sig == 1 and p_up < 0.55:
-                    reasons.append("Filter: model p(up) < 0.55")
+                if sig == 1 and p_up < 0.52:
+                    reasons.append("Filter: model p(up) < 0.52")
                     sig = 0
-                if sig == -1 and p_up > 0.45:
-                    reasons.append("Filter: model p(up) > 0.45")
+                if sig == -1 and p_up > 0.48:
+                    reasons.append("Filter: model p(up) > 0.48")
                     sig = 0
     except Exception:
         pass
@@ -1863,7 +1880,12 @@ def auto_trade():
             prices = {}
             
             for pair, ticker in PAIRS.items():
-                data = get_data(ticker)
+                data = None
+                if pair in CRYPTO_PAIRS:
+                    data = update_market_data(pair, tf="15m", bars=200, min_age_sec=60)
+                else:
+                    data = get_data(ticker)
+
                 if data is not None and not data.empty:
                     ind = get_indicators(data, pair)
                     prices[pair] = ind['price']
