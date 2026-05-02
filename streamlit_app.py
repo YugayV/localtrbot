@@ -41,6 +41,7 @@ def _get_trades_df():
     return pd.DataFrame(list(reversed((botmod.account.trades or [])[-100:])))
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def _get_pair_history(pair: str, tf: str, zz: float):
     df, tf_norm = botmod.get_history(pair, tf=tf)
     df = df.tail(2000)
@@ -51,6 +52,7 @@ def _get_pair_history(pair: str, tf: str, zz: float):
     return df, tf_norm, swings, impulse
 
 
+@st.cache_data(ttl=10, show_spinner=False)
 def _intraday_signal_and_plan(pair: str, tf_norm: str):
     ticker = botmod.PAIRS[pair]
 
@@ -107,6 +109,10 @@ def _fmt_ts(ts):
         return str(ts)
 
 st.title("LocalTRBot — Streamlit Dashboard")
+
+if st.button("Refresh data", width="stretch"):
+    st.cache_data.clear()
+    st.rerun()
 
 auto_alive = bool(bg.get("auto_thread")) and bg["auto_thread"].is_alive()
 poll_alive = bool(bg.get("poll_thread")) and bg["poll_thread"].is_alive()
@@ -166,8 +172,13 @@ with col_left:
     zz = st.slider("ZigZag sensitivity (x)", min_value=0.5, max_value=3.0, value=1.0, step=0.1)
     only_valid = st.checkbox("Only valid impulse", value=False)
 
-    df, tf_norm, swings, impulse = _get_pair_history(pair, tf, zz)
-    sig, reasons, ind, confirm, plan = _intraday_signal_and_plan(pair, tf_norm)
+    try:
+        with st.spinner("Loading market data..."):
+            df, tf_norm, swings, impulse = _get_pair_history(pair, tf, zz)
+            sig, reasons, ind, confirm, plan = _intraday_signal_and_plan(pair, tf_norm)
+    except Exception as e:
+        st.error(f"Data load error: {e}")
+        st.stop()
 
     sig_txt = "NO SIGNAL"
     if sig == 1:

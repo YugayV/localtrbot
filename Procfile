@@ -1,1 +1,1 @@
-web: streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.runOnSave false
+web: streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.runOnSave false --server.enableCORS false --server.enableXsrfProtection false --server.fileWatcherType none --browser.gatherUsageStats false
