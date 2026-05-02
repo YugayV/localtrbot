@@ -66,6 +66,9 @@ CONFIG_DEFAULTS = {
     "tp_pips": 300,
     "check_interval": 60,
     "auto_trade_enabled": True,
+    "daily_profit_target_pct": 0.0,
+    "daily_loss_limit_pct": 0.0,
+    "close_positions_on_stop": False,
 }
 
 
@@ -99,6 +102,9 @@ RUNTIME = {
     "auto_trade_last_open_ts": None,
     "auto_trade_last_open_pair": None,
     "bot_poll_last_error": None,
+    "day_key": None,
+    "day_start_balance": None,
+    "trading_paused_reason": None,
 }
 
 # OPTIMIZED PAIRS (by performance analysis)
@@ -719,6 +725,7 @@ class Account:
         lot = risk / (max(sl_pips, 0.00001) * 10) * leverage
         lot = max(0.01, min(lot, 1.0))
         
+        now_ts = time.time()
         pos = {
             'pair': ind['pair'],
             'direction': direction,
@@ -727,6 +734,7 @@ class Account:
             'tp': tp_price,
             'lot': lot,
             'risk': risk,
+            'open_ts': now_ts,
             'time': datetime.now().strftime('%H:%M'),
             'status': 'OPEN'
         }
@@ -771,12 +779,70 @@ class Account:
                     self.balance += pos['pnl']
                     closed.append(pos)
         
+        close_ts = time.time()
         for pos in closed:
+            if pos.get("close_ts") is None:
+                pos["close_ts"] = close_ts
+                try:
+                    pos["close_price"] = float(prices.get(pos.get("pair")))
+                except Exception:
+                    pass
             self.positions.remove(pos)
             self.trades.append(pos)
         self.save_state()
         return closed
     
+    def _mtm_pnl(self, pos, price):
+        with config_lock:
+            sl_pips = float(CONFIG["sl_pips"])
+            tp_pips = float(CONFIG["tp_pips"])
+
+        risk = float(pos.get("risk") or 0.0)
+        max_profit = risk * (tp_pips / max(sl_pips, 0.00001))
+
+        entry = float(pos.get("entry") or 0.0)
+        sl = float(pos.get("sl") or entry)
+
+        if int(pos.get("direction") or 0) == 1:
+            sl_move = max(entry - sl, 1e-9)
+            rr = (float(price) - entry) / sl_move
+        else:
+            sl_move = max(sl - entry, 1e-9)
+            rr = (entry - float(price)) / sl_move
+
+        pnl = risk * rr
+        pnl = max(-risk, min(pnl, max_profit))
+        return float(pnl)
+
+    def force_close_all(self, prices, reason="MANUAL"):
+        if not prices:
+            return []
+        closed = []
+        close_ts = time.time()
+        for pos in self.positions[:]:
+            if pos.get("status") != "OPEN":
+                continue
+            pair = pos.get("pair")
+            if pair not in prices:
+                continue
+            price = float(prices[pair])
+
+            pnl = self._mtm_pnl(pos, price)
+            pos["status"] = str(reason)
+            pos["pnl"] = pnl
+            pos["close_ts"] = close_ts
+            pos["close_price"] = price
+
+            self.balance += pnl
+            closed.append(pos)
+            self.positions.remove(pos)
+            self.trades.append(pos)
+
+        if closed:
+            self.save_state()
+
+        return closed
+
     def stats(self):
         total = len(self.trades)
         wins = len([t for t in self.trades if t['status'] == 'WIN'])
@@ -1558,11 +1624,59 @@ def apply_config_patch(patch):
     if "auto_trade_enabled" in patch:
         out["auto_trade_enabled"] = to_bool(patch["auto_trade_enabled"])
 
+    if "daily_profit_target_pct" in patch:
+        out["daily_profit_target_pct"] = float(patch["daily_profit_target_pct"])
+        if out["daily_profit_target_pct"] < 0 or out["daily_profit_target_pct"] > 100:
+            raise ValueError("daily_profit_target_pct must be in [0, 100]")
+
+    if "daily_loss_limit_pct" in patch:
+        out["daily_loss_limit_pct"] = float(patch["daily_loss_limit_pct"])
+        if out["daily_loss_limit_pct"] < 0 or out["daily_loss_limit_pct"] > 100:
+            raise ValueError("daily_loss_limit_pct must be in [0, 100]")
+
+    if "close_positions_on_stop" in patch:
+        out["close_positions_on_stop"] = to_bool(patch["close_positions_on_stop"])
+
     with config_lock:
         CONFIG.update(out)
         save_config(CONFIG)
 
     return get_public_config()
+
+
+def _utc_day_key():
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _ensure_day_start():
+    dk = _utc_day_key()
+    if RUNTIME.get("day_key") != dk or RUNTIME.get("day_start_balance") is None:
+        RUNTIME["day_key"] = dk
+        RUNTIME["day_start_balance"] = float(account.balance)
+        RUNTIME["trading_paused_reason"] = None
+
+
+def set_auto_trade_enabled(enabled, reason=None):
+    with config_lock:
+        CONFIG["auto_trade_enabled"] = bool(enabled)
+        save_config(CONFIG)
+
+    if enabled:
+        RUNTIME["trading_paused_reason"] = None
+    else:
+        RUNTIME["trading_paused_reason"] = str(reason) if reason else "PAUSED"
+
+    return get_public_config()
+
+
+def close_all_positions(reason="MANUAL"):
+    prices = {}
+    for pair, ind in (current_prices or {}).items():
+        try:
+            prices[pair] = float(ind.get("price"))
+        except Exception:
+            continue
+    return account.force_close_all(prices, reason=reason)
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -1921,9 +2035,38 @@ def auto_trade():
                         text += f"{pos['pair']}: {pos['status']} ${pos['pnl']:+.2f}\n"
                     notify(text)
             
+            _ensure_day_start()
+
             with config_lock:
                 enabled = bool(CONFIG.get("auto_trade_enabled", True))
                 trades_per_pair = int(CONFIG["trades_per_pair"])
+                daily_profit_target_pct = float(CONFIG.get("daily_profit_target_pct", 0) or 0)
+                daily_loss_limit_pct = float(CONFIG.get("daily_loss_limit_pct", 0) or 0)
+                close_positions_on_stop = bool(CONFIG.get("close_positions_on_stop", False))
+
+            day_start = float(RUNTIME.get("day_start_balance") or account.balance)
+            daily_pnl = float(account.balance - day_start)
+            daily_pct = (daily_pnl / day_start * 100.0) if day_start else 0.0
+
+            if enabled and daily_profit_target_pct > 0 and daily_pct >= daily_profit_target_pct:
+                reason = f"DAILY PROFIT TARGET {daily_pct:.2f}% >= {daily_profit_target_pct:.2f}%"
+                set_auto_trade_enabled(False, reason=reason)
+                enabled = False
+                notify(f"<b>PAUSE</b>\n{reason}")
+                if close_positions_on_stop and prices:
+                    c = account.force_close_all(prices, reason="PROFIT STOP")
+                    if c:
+                        notify(f"<b>CLOSE ALL</b>\nReason: PROFIT STOP\nClosed: {len(c)}")
+
+            if enabled and daily_loss_limit_pct > 0 and daily_pct <= -daily_loss_limit_pct:
+                reason = f"DAILY LOSS LIMIT {daily_pct:.2f}% <= -{daily_loss_limit_pct:.2f}%"
+                set_auto_trade_enabled(False, reason=reason)
+                enabled = False
+                notify(f"<b>PAUSE</b>\n{reason}")
+                if close_positions_on_stop and prices:
+                    c = account.force_close_all(prices, reason="LOSS STOP")
+                    if c:
+                        notify(f"<b>CLOSE ALL</b>\nReason: LOSS STOP\nClosed: {len(c)}")
 
             candidates = 0
             sample = None

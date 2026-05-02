@@ -160,6 +160,39 @@ with col_right:
     st.subheader("Control Panel")
     cfg = botmod.get_public_config()
 
+    st.subheader("Trading")
+
+    paused_reason = (rt.get("trading_paused_reason") if isinstance(rt, dict) else None) or ""
+    day_start = (rt.get("day_start_balance") if isinstance(rt, dict) else None)
+    try:
+        day_start_f = float(day_start) if day_start is not None else None
+    except Exception:
+        day_start_f = None
+    daily_pnl = (float(botmod.account.balance) - day_start_f) if day_start_f else None
+
+    st.caption(f"Paused reason: {paused_reason or '—'}")
+    if daily_pnl is not None and day_start_f:
+        st.caption(f"Today PnL: {daily_pnl:+.2f} ({(daily_pnl / day_start_f * 100.0):+.2f}%)")
+
+    cta1, cta2 = st.columns(2)
+    with cta1:
+        if st.button("Pause trading", width="stretch"):
+            botmod.set_auto_trade_enabled(False, reason="MANUAL PAUSE")
+            st.success("Trading paused")
+            st.rerun()
+    with cta2:
+        if st.button("Resume trading", width="stretch"):
+            botmod.set_auto_trade_enabled(True, reason=None)
+            st.success("Trading resumed")
+            st.rerun()
+
+    if st.button("Close all open positions", width="stretch"):
+        closed = botmod.close_all_positions(reason="MANUAL CLOSE")
+        st.success(f"Closed: {len(closed)}")
+        st.rerun()
+
+    st.subheader("Risk & Profit")
+
     risk_per_trade = st.number_input("Risk per trade (%)", min_value=0.1, max_value=100.0, value=float(cfg["risk_per_trade"]), step=0.1)
     trades_per_pair = st.number_input("Trades per pair", min_value=0, max_value=20, value=int(cfg["trades_per_pair"]), step=1)
     sl_pips = st.number_input("SL (pips / $)", min_value=0.01, value=float(cfg["sl_pips"]), step=0.01)
@@ -167,6 +200,26 @@ with col_right:
     leverage = st.number_input("Leverage", min_value=0.1, max_value=1000.0, value=float(cfg["leverage"]), step=1.0)
     check_interval = st.number_input("Check interval (sec)", min_value=5, value=int(cfg["check_interval"]), step=5)
     auto_trade_enabled = st.selectbox("Auto-trade enabled", ["true", "false"], index=0 if bool(cfg["auto_trade_enabled"]) else 1)
+
+    daily_profit_target_pct = st.number_input(
+        "Daily profit target (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=float(cfg.get("daily_profit_target_pct", 0.0) or 0.0),
+        step=0.1,
+    )
+    daily_loss_limit_pct = st.number_input(
+        "Daily loss limit (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=float(cfg.get("daily_loss_limit_pct", 0.0) or 0.0),
+        step=0.1,
+    )
+    close_positions_on_stop = st.selectbox(
+        "Close positions on stop",
+        ["false", "true"],
+        index=1 if bool(cfg.get("close_positions_on_stop", False)) else 0,
+    )
 
     if st.button("Save settings", width="stretch"):
         botmod.apply_config_patch(
@@ -178,6 +231,9 @@ with col_right:
                 "leverage": leverage,
                 "check_interval": check_interval,
                 "auto_trade_enabled": auto_trade_enabled,
+                "daily_profit_target_pct": daily_profit_target_pct,
+                "daily_loss_limit_pct": daily_loss_limit_pct,
+                "close_positions_on_stop": close_positions_on_stop,
             }
         )
         st.success("Saved")
