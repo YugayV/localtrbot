@@ -15,9 +15,11 @@ st.set_page_config(page_title="LocalTRBot", layout="wide")
 @st.cache_resource
 def _start_background():
     def _run_auto():
+        print("[AUTO] thread started", flush=True)
         botmod.auto_trade()
 
     def _run_poll():
+        print("[TG] polling thread started", flush=True)
         try:
             botmod.bot.remove_webhook()
         except Exception:
@@ -25,7 +27,7 @@ def _start_background():
         botmod.run_bot_polling()
 
     def _run_data_updater():
-        print("[DATA] updater started")
+        print("[DATA] updater started", flush=True)
         while True:
             try:
                 n = 0
@@ -34,9 +36,9 @@ def _start_background():
                     botmod.update_market_data(p, tf="1h", bars=2000, min_age_sec=300)
                     n += 1
                     time.sleep(0.1)
-                print(f"[DATA] updater cycle ok pairs={n}")
+                print(f"[DATA] updater cycle ok pairs={n}", flush=True)
             except Exception as e:
-                print(f"[DATA] updater error: {e}")
+                print(f"[DATA] updater error: {e}", flush=True)
             time.sleep(30)
 
     t1 = threading.Thread(target=_run_auto, daemon=True)

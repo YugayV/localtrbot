@@ -663,27 +663,39 @@ class Account:
     def load_state(self):
         if os.path.exists(STATE_FILE):
             try:
-                with open(STATE_FILE, 'r') as f:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self.balance = data.get('balance', CONFIG["initial_balance"])
-                    self.initial = data.get('initial', CONFIG["initial_balance"])
-                    self.trades = data.get('trades', [])
-                    self.peak = data.get('peak', self.balance)
-                    self.max_dd = data.get('max_dd', 0)
-            except:
+
+                self.balance = data.get("balance", CONFIG["initial_balance"])
+                self.initial = data.get("initial", CONFIG["initial_balance"])
+                self.trades = data.get("trades", []) or []
+                self.positions = data.get("positions", []) or []
+                self.peak = data.get("peak", self.balance)
+                self.max_dd = data.get("max_dd", 0)
+
+                ts = data.get("last_report_ts")
+                if ts:
+                    self.last_report = datetime.fromtimestamp(float(ts))
+            except Exception:
                 pass
     
     def save_state(self):
         try:
-            with open(STATE_FILE, 'w') as f:
-                json.dump({
-                    'balance': self.balance,
-                    'initial': self.initial,
-                    'trades': self.trades[-100:],  # keep last 100
-                    'peak': self.peak,
-                    'max_dd': self.max_dd
-                }, f, indent=2)
-        except:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "balance": self.balance,
+                        "initial": self.initial,
+                        "trades": self.trades[-100:],
+                        "positions": [p for p in self.positions if p.get("status") == "OPEN"],
+                        "peak": self.peak,
+                        "max_dd": self.max_dd,
+                        "last_report_ts": self.last_report.timestamp() if self.last_report else None,
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception:
             pass
     
     def open_trade(self, direction, ind):
@@ -1961,7 +1973,7 @@ def auto_trade():
                 if sample is not None:
                     p, s, rs = sample
                     msg += f" sample={p} {'BUY' if s==1 else 'SELL'}: " + ", ".join(rs)
-                print(msg)
+                print(msg, flush=True)
             except Exception:
                 pass
 
@@ -1971,7 +1983,7 @@ def auto_trade():
         
         except Exception as e:
             RUNTIME["auto_trade_last_error"] = str(e)
-            print(f"Error: {e}")
+            print(f"Error: {e}", flush=True)
             time.sleep(60)
 
 def run_bot_polling():
@@ -1988,15 +2000,15 @@ def run_bot_polling():
         except ApiTelegramException as e:
             RUNTIME["bot_poll_last_error"] = str(e)
             if getattr(e, "error_code", None) == 409:
-                print("Telegram 409 Conflict: another getUpdates is running for this bot token. Ensure only one polling instance is running or enable webhook mode.")
+                print("Telegram 409 Conflict: another getUpdates is running for this bot token. Ensure only one polling instance is running or enable webhook mode.", flush=True)
                 time.sleep(15)
                 continue
-            print(f"Telegram API error: {e}")
+            print(f"Telegram API error: {e}", flush=True)
             time.sleep(backoff)
             backoff = min(backoff * 2, 300)
         except Exception as e:
             RUNTIME["bot_poll_last_error"] = str(e)
-            print(f"Polling error: {e}")
+            print(f"Polling error: {e}", flush=True)
             time.sleep(backoff)
             backoff = min(backoff * 2, 300)
 
