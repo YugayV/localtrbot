@@ -14,17 +14,38 @@ st.set_page_config(page_title="LocalTRBot", layout="wide")
 
 @st.cache_resource
 def _start_background():
+    started_at = time.time()
+    auto_restart_hourly = str(os.environ.get("AUTO_RESTART_HOURLY", "1") or "1").strip().lower() not in ["0", "false", "no", "off"]
+
     def _run_auto():
         print("[AUTO] thread started", flush=True)
-        botmod.auto_trade()
+        while True:
+            try:
+                botmod.auto_trade()
+            except BaseException as e:
+                try:
+                    botmod.RUNTIME["auto_trade_last_error"] = str(e)
+                except Exception:
+                    pass
+                print(f"[AUTO] crashed: {e}", flush=True)
+                time.sleep(5)
 
     def _run_poll():
         print("[TG] polling thread started", flush=True)
-        try:
-            botmod.bot.remove_webhook()
-        except Exception:
-            pass
-        botmod.run_bot_polling()
+        while True:
+            try:
+                try:
+                    botmod.bot.remove_webhook()
+                except Exception:
+                    pass
+                botmod.run_bot_polling()
+            except BaseException as e:
+                try:
+                    botmod.RUNTIME["bot_poll_last_error"] = str(e)
+                except Exception:
+                    pass
+                print(f"[TG] crashed: {e}", flush=True)
+                time.sleep(5)
 
     def _run_data_updater():
         print("[DATA] updater started", flush=True)
@@ -50,7 +71,29 @@ def _start_background():
     t3 = threading.Thread(target=_run_data_updater, daemon=True)
     t3.start()
 
-    return {"started_at": time.time(), "auto_thread": t1, "poll_thread": t2, "data_thread": t3}
+    def _run_watchdog():
+        print("[WD] watchdog started", flush=True)
+        while True:
+            try:
+                if auto_restart_hourly and (time.time() - started_at) >= 3600:
+                    try:
+                        botmod.account.save_state()
+                    except Exception:
+                        pass
+                    try:
+                        botmod.save_config(botmod.CONFIG)
+                    except Exception:
+                        pass
+                    print("[WD] hourly restart", flush=True)
+                    os._exit(0)
+            except Exception:
+                pass
+            time.sleep(10)
+
+    t4 = threading.Thread(target=_run_watchdog, daemon=True)
+    t4.start()
+
+    return {"started_at": started_at, "auto_thread": t1, "poll_thread": t2, "data_thread": t3, "watchdog_thread": t4}
 
 
 def _get_positions_df():

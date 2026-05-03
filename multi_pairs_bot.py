@@ -47,6 +47,8 @@ load_env(os.path.join(BASE_DIR, ".env"))
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")
+TRADE_LOG_FILE = os.path.join(BASE_DIR, "trades_log.jsonl")
+_LOG_LOCK = threading.Lock()
 
 WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
@@ -87,13 +89,32 @@ def load_config():
 
 def save_config(cfg):
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
+        os.replace(tmp, CONFIG_FILE)
     except:
-        pass
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
 
 CONFIG = load_config()
+
+
+def _append_trade_event(evt):
+    try:
+        if not isinstance(evt, dict):
+            return
+        line = json.dumps(evt, ensure_ascii=False)
+        with _LOG_LOCK:
+            with open(TRADE_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
 
 RUNTIME = {
     "auto_trade_last_loop_ts": None,
@@ -702,12 +723,13 @@ class Account:
     
     def save_state(self):
         try:
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "balance": self.balance,
                         "initial": self.initial,
-                        "trades": self.trades[-100:],
+                        "trades": self.trades,
                         "positions": [p for p in self.positions if p.get("status") == "OPEN"],
                         "peak": self.peak,
                         "max_dd": self.max_dd,
@@ -716,8 +738,13 @@ class Account:
                     f,
                     indent=2,
                 )
+            os.replace(tmp, STATE_FILE)
         except Exception:
-            pass
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
     
     def open_trade(self, direction, ind):
         pair = ind['pair']
@@ -754,6 +781,20 @@ class Account:
             'status': 'OPEN'
         }
         self.positions.append(pos)
+        _append_trade_event(
+            {
+                "type": "OPEN",
+                "ts": now_ts,
+                "pair": pos.get("pair"),
+                "direction": int(pos.get("direction") or 0),
+                "entry": float(pos.get("entry") or 0.0),
+                "sl": float(pos.get("sl") or 0.0),
+                "tp": float(pos.get("tp") or 0.0),
+                "risk": float(pos.get("risk") or 0.0),
+                "lot": float(pos.get("lot") or 0.0),
+            }
+        )
+        self.save_state()
         return pos
     
     def check_all_positions(self, prices):
@@ -804,6 +845,19 @@ class Account:
                     pass
             self.positions.remove(pos)
             self.trades.append(pos)
+            _append_trade_event(
+                {
+                    "type": "CLOSE",
+                    "ts": float(pos.get("close_ts") or close_ts),
+                    "pair": pos.get("pair"),
+                    "direction": int(pos.get("direction") or 0),
+                    "entry": float(pos.get("entry") or 0.0),
+                    "close": float(pos.get("close_price") or 0.0),
+                    "status": pos.get("status"),
+                    "pnl": float(pos.get("pnl") or 0.0),
+                    "risk": float(pos.get("risk") or 0.0),
+                }
+            )
         self.save_state()
         return closed
     
@@ -852,6 +906,19 @@ class Account:
             closed.append(pos)
             self.positions.remove(pos)
             self.trades.append(pos)
+            _append_trade_event(
+                {
+                    "type": "CLOSE",
+                    "ts": float(pos.get("close_ts") or close_ts),
+                    "pair": pos.get("pair"),
+                    "direction": int(pos.get("direction") or 0),
+                    "entry": float(pos.get("entry") or 0.0),
+                    "close": float(pos.get("close_price") or 0.0),
+                    "status": pos.get("status"),
+                    "pnl": float(pos.get("pnl") or 0.0),
+                    "risk": float(pos.get("risk") or 0.0),
+                }
+            )
 
         if closed:
             self.save_state()
