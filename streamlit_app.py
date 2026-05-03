@@ -54,10 +54,18 @@ def _start_background():
 
 
 def _get_positions_df():
+    try:
+        botmod.account.load_state()
+    except Exception:
+        pass
     return pd.DataFrame(list(botmod.account.positions or []))
 
 
 def _get_trades_df():
+    try:
+        botmod.account.load_state()
+    except Exception:
+        pass
     return pd.DataFrame(list(reversed((botmod.account.trades or [])[-100:])))
 
 
