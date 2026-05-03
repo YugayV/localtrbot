@@ -604,19 +604,22 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
     reasons.append(f"TF 15m RSI:{ind15['rsi']:.0f} Trend:{'UP' if ind15['trend']==1 else 'DOWN'}")
     reasons.append(f"Confirm 1h RSI:{ind1h['rsi']:.0f} Trend:{'UP' if ind1h['trend']==1 else 'DOWN'}")
 
-    if sig15 == 1 and ind15['trend'] != 1:
-        reasons.append("Filter: 15m trend not UP")
-        sig = 0
-    if sig15 == -1 and ind15['trend'] != -1:
-        reasons.append("Filter: 15m trend not DOWN")
-        sig = 0
+    if pair not in CRYPTO_PAIRS:
+        if sig15 == 1 and ind15['trend'] != 1:
+            reasons.append("Filter: 15m trend not UP")
+            sig = 0
+        if sig15 == -1 and ind15['trend'] != -1:
+            reasons.append("Filter: 15m trend not DOWN")
+            sig = 0
 
-    if sig15 == 1 and ind1h['trend'] != 1:
-        reasons.append("Filter: 1h trend not UP")
-        sig = 0
-    if sig15 == -1 and ind1h['trend'] != -1:
-        reasons.append("Filter: 1h trend not DOWN")
-        sig = 0
+        if sig15 == 1 and ind1h['trend'] != 1:
+            reasons.append("Filter: 1h trend not UP")
+            sig = 0
+        if sig15 == -1 and ind1h['trend'] != -1:
+            reasons.append("Filter: 1h trend not DOWN")
+            sig = 0
+    else:
+        reasons.append("Crypto mode: trend filters disabled")
 
     if pair not in CRYPTO_PAIRS:
         if sig15 == 1 and float(ind1h.get('rsi', 50) or 50) < 48:
