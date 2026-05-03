@@ -566,8 +566,11 @@ def check_signal(ind, enforce_hours=True):
     if enforce_hours and get_seoul_time().hour not in GOOD_HOURS:
         return 0, signals
 
-    buy = sum(1 for s in signals if any(x in s for x in ["DOWN", "Oversold", "Trend Up"]))
-    sell = sum(1 for s in signals if any(x in s for x in ["UP", "Overbought", "Trend Down"]))
+    buy_keys = ["Proxy DOWN", "Strong Down", "RSI Oversold", "Trend Up"]
+    sell_keys = ["Proxy UP", "Strong Up", "RSI Overbought", "Trend Down"]
+
+    buy = sum(1 for s in signals if any(k in s for k in buy_keys))
+    sell = sum(1 for s in signals if any(k in s for k in sell_keys))
 
     min_signals = 2
 
@@ -2193,14 +2196,16 @@ def auto_trade():
                 RUNTIME["auto_trade_last_candidates"] = int(candidates)
                 if sample is not None:
                     p, s, rs = sample
-                    RUNTIME["auto_trade_last_sample"] = f"{p} {'BUY' if s==1 else 'SELL'}: " + ", ".join(rs)
+                    dir_txt = "BUY" if s == 1 else "SELL" if s == -1 else "NO SIGNAL"
+                    RUNTIME["auto_trade_last_sample"] = f"{p} {dir_txt}: " + ", ".join(rs)
                 else:
                     RUNTIME["auto_trade_last_sample"] = None
 
                 msg = f"[AUTO] enabled={enabled} open={open_cnt} candidates={candidates}"
                 if sample is not None:
                     p, s, rs = sample
-                    msg += f" sample={p} {'BUY' if s==1 else 'SELL'}: " + ", ".join(rs)
+                    dir_txt = "BUY" if s == 1 else "SELL" if s == -1 else "NO SIGNAL"
+                    msg += f" sample={p} {dir_txt}: " + ", ".join(rs)
                 print(msg, flush=True)
             except Exception:
                 pass
