@@ -618,30 +618,33 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
         reasons.append("Filter: 1h trend not DOWN")
         sig = 0
 
-    if sig15 == 1 and float(ind1h.get('rsi', 50) or 50) < 48:
-        reasons.append("Filter: 1h RSI < 48")
-        sig = 0
-    if sig15 == -1 and float(ind1h.get('rsi', 50) or 50) > 52:
-        reasons.append("Filter: 1h RSI > 52")
-        sig = 0
+    if pair not in CRYPTO_PAIRS:
+        if sig15 == 1 and float(ind1h.get('rsi', 50) or 50) < 48:
+            reasons.append("Filter: 1h RSI < 48")
+            sig = 0
+        if sig15 == -1 and float(ind1h.get('rsi', 50) or 50) > 52:
+            reasons.append("Filter: 1h RSI > 52")
+            sig = 0
 
-    try:
-        lookback = 10
-        if len(d15) > lookback + 2:
-            prev_high = float(d15['High'].iloc[-(lookback + 1):-1].max())
-            prev_low = float(d15['Low'].iloc[-(lookback + 1):-1].min())
+        try:
+            lookback = 10
+            if len(d15) > lookback + 2:
+                prev_high = float(d15['High'].iloc[-(lookback + 1):-1].max())
+                prev_low = float(d15['Low'].iloc[-(lookback + 1):-1].min())
 
-            strong_up = any("Strong Up" in s or "Proxy UP" in s for s in reasons)
-            strong_dn = any("Strong Down" in s or "Proxy DOWN" in s for s in reasons)
+                strong_up = any("Strong Up" in s or "Proxy UP" in s for s in reasons)
+                strong_dn = any("Strong Down" in s or "Proxy DOWN" in s for s in reasons)
 
-            if sig15 == 1 and float(ind15.get('price')) < prev_high and not strong_up:
-                reasons.append("Filter: no 10-bar breakout")
-                sig = 0
-            if sig15 == -1 and float(ind15.get('price')) > prev_low and not strong_dn:
-                reasons.append("Filter: no 10-bar breakdown")
-                sig = 0
-    except Exception:
-        pass
+                if sig15 == 1 and float(ind15.get('price')) < prev_high and not strong_up:
+                    reasons.append("Filter: no 10-bar breakout")
+                    sig = 0
+                if sig15 == -1 and float(ind15.get('price')) > prev_low and not strong_dn:
+                    reasons.append("Filter: no 10-bar breakdown")
+                    sig = 0
+        except Exception:
+            pass
+    else:
+        reasons.append("Crypto mode: relaxed filters (no 1h RSI / no breakout)")
 
     try:
         model = load_direction_model(pair, tf="15m")
@@ -2148,10 +2151,11 @@ def auto_trade():
                     continue
 
                 sig, sigs, ind15, ind1h = get_intraday_signal(pair, ticker, enforce_hours=False)
+                if ind15 is not None and sample is None:
+                    sample = (pair, sig, list(sigs)[:6])
+
                 if sig != 0 and ind15 is not None:
                     candidates += 1
-                    if sample is None:
-                        sample = (pair, sig, list(sigs)[:6])
 
                 if sig == 0 or ind15 is None:
                     continue
