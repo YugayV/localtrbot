@@ -163,6 +163,8 @@ with col_right:
     st.subheader("Trading")
 
     paused_reason = (rt.get("trading_paused_reason") if isinstance(rt, dict) else None) or ""
+    enabled_now = bool((cfg or {}).get("auto_trade_enabled", True))
+
     day_start = (rt.get("day_start_balance") if isinstance(rt, dict) else None)
     try:
         day_start_f = float(day_start) if day_start is not None else None
@@ -170,9 +172,26 @@ with col_right:
         day_start_f = None
     daily_pnl = (float(botmod.account.balance) - day_start_f) if day_start_f else None
 
+    st.caption(f"Trading: {'ON' if enabled_now else 'OFF'}")
     st.caption(f"Paused reason: {paused_reason or '—'}")
     if daily_pnl is not None and day_start_f:
         st.caption(f"Today PnL: {daily_pnl:+.2f} ({(daily_pnl / day_start_f * 100.0):+.2f}%)")
+
+    last_cand = (rt.get("auto_trade_last_candidates") if isinstance(rt, dict) else None)
+    last_sample = (rt.get("auto_trade_last_sample") if isinstance(rt, dict) else None)
+    if last_cand is not None:
+        st.caption(f"Last scan: candidates={last_cand}")
+    if last_sample:
+        st.caption(f"Sample: {last_sample}")
+
+    if st.button("START trading" if not enabled_now else "STOP trading", width="stretch"):
+        if enabled_now:
+            botmod.set_auto_trade_enabled(False, reason="MANUAL PAUSE")
+            st.success("Trading stopped")
+        else:
+            botmod.set_auto_trade_enabled(True, reason=None)
+            st.success("Trading started")
+        st.rerun()
 
     cta1, cta2 = st.columns(2)
     with cta1:
@@ -242,11 +261,18 @@ with col_right:
         st.caption("Скачивает данные в ./data и сохраняет модель в ./models (в Railway хранилище может быть временным)")
 
         pair_dm = st.selectbox("Pair", list(botmod.PAIRS.keys()), key="dm_pair")
-        tf_dm = st.selectbox("TF", ["15m", "1h", "1d", "1wk"], key="dm_tf")
+        is_crypto = pair_dm in (getattr(botmod, "CRYPTO_PAIRS", set()) or set())
+
+        tf_opts = ["15m", "1h"] if is_crypto else ["15m", "1h", "1d", "1wk"]
+        if "dm_tf" in st.session_state and st.session_state["dm_tf"] not in tf_opts:
+            st.session_state["dm_tf"] = tf_opts[0]
+        tf_dm = st.selectbox("TF", tf_opts, key="dm_tf")
+
+        force_dl = st.checkbox("Force re-download", value=False)
 
         if st.button("Update data", width="stretch"):
             try:
-                df_u = botmod.update_market_data(pair_dm, tf=tf_dm, bars=3000)
+                df_u = botmod.update_market_data(pair_dm, tf=tf_dm, bars=3000, force=force_dl, min_rows=240)
                 if df_u is None or df_u.empty:
                     st.error("No data downloaded")
                 else:
@@ -257,12 +283,9 @@ with col_right:
         if st.button("Train 15m model", width="stretch"):
             try:
                 m = botmod.train_direction_model(pair_dm, tf="15m", bars=5000)
-                if not m:
-                    st.error("Training failed (not enough data)")
-                else:
-                    acc = float((m.get("metrics") or {}).get("acc") or 0)
-                    n = int((m.get("metrics") or {}).get("n") or 0)
-                    st.success(f"Trained: acc={acc:.2f} n={n}")
+                acc = float((m.get("metrics") or {}).get("acc") or 0)
+                n = int((m.get("metrics") or {}).get("n") or 0)
+                st.success(f"Trained: acc={acc:.2f} n={n}")
             except Exception as e:
                 st.error(f"Train error: {e}")
 

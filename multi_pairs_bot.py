@@ -101,6 +101,8 @@ RUNTIME = {
     "auto_trade_last_error": None,
     "auto_trade_last_open_ts": None,
     "auto_trade_last_open_pair": None,
+    "auto_trade_last_candidates": None,
+    "auto_trade_last_sample": None,
     "bot_poll_last_error": None,
     "day_key": None,
     "day_start_balance": None,
@@ -219,16 +221,17 @@ def _bybit_kline(pair, interval_min, limit=1000, end_ms=None, category="linear")
         return None
 
 
-def update_market_data(pair, tf="15m", bars=3000, min_age_sec=300):
+def update_market_data(pair, tf="15m", bars=3000, min_age_sec=300, force=False, min_rows=0):
     tf_norm = tf.lower().strip()
     path = os.path.join(DATA_DIR, f"{pair}_{tf_norm}.csv")
 
     try:
-        if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < int(min_age_sec):
+        if (not force) and os.path.exists(path) and (time.time() - os.path.getmtime(path)) < int(min_age_sec):
             cached = pd.read_csv(path, parse_dates=["Datetime"])
             cached = cached.set_index("Datetime")
-            if not cached.empty:
-                return cached
+            if cached is not None and (not cached.empty):
+                if int(min_rows) <= 0 or len(cached) >= int(min_rows):
+                    return cached
     except Exception:
         pass
 
@@ -236,7 +239,8 @@ def update_market_data(pair, tf="15m", bars=3000, min_age_sec=300):
 
     if pair in CRYPTO_PAIRS and tf_norm in ["15m", "1h"]:
         interval_min = 15 if tf_norm == "15m" else 60
-        need = int(bars)
+        target = max(int(bars), int(min_rows) if int(min_rows) > 0 else 0)
+        need = int(target)
         parts = []
         end_ms = None
         while need > 0 and len(parts) < 10:
@@ -280,9 +284,11 @@ def update_market_data(pair, tf="15m", bars=3000, min_age_sec=300):
 
 def train_direction_model(pair, tf="15m", bars=5000, lr=0.2, epochs=250, l2=1e-4):
     tf_norm = str(tf).lower().strip()
-    df = update_market_data(pair, tf=tf_norm, bars=bars)
-    if df is None or df.empty or len(df) < 200:
-        return None
+    df = update_market_data(pair, tf=tf_norm, bars=bars, min_age_sec=0, min_rows=240)
+    if df is None or df.empty:
+        raise ValueError(f"Not enough data: pair={pair} tf={tf_norm} rows=0")
+    if len(df) < 200:
+        raise ValueError(f"Not enough data: pair={pair} tf={tf_norm} rows={len(df)} (need >= 200)")
 
     close = df["Close"].astype(float)
     ret1 = close.pct_change()
@@ -1834,6 +1840,58 @@ def notify(text):
 def fp(pair, ind):
     return fmt_price(pair, ind['price'])
 
+
+def _is_admin(m):
+    try:
+        uid = int(getattr(getattr(m, "from_user", None), "id", 0) or 0)
+    except Exception:
+        uid = 0
+    try:
+        cid = int(getattr(getattr(m, "chat", None), "id", 0) or 0)
+    except Exception:
+        cid = 0
+    return uid == int(ADMIN_ID) or cid == int(ADMIN_ID)
+
+
+def _require_admin(m):
+    if _is_admin(m):
+        return True
+    bot.reply_to(m, "Access denied")
+    return False
+
+
+@bot.message_handler(commands=['trading'])
+def trading(m):
+    with config_lock:
+        enabled = bool(CONFIG.get("auto_trade_enabled", True))
+    paused_reason = (RUNTIME.get("trading_paused_reason") if isinstance(RUNTIME, dict) else None) or ""
+    bot.reply_to(m, f"Trading: {'ON' if enabled else 'OFF'}\nReason: {paused_reason or '—'}")
+
+
+@bot.message_handler(commands=['pause'])
+def pause(m):
+    if not _require_admin(m):
+        return
+    set_auto_trade_enabled(False, reason="MANUAL PAUSE")
+    bot.reply_to(m, "Trading paused")
+
+
+@bot.message_handler(commands=['resume'])
+def resume(m):
+    if not _require_admin(m):
+        return
+    set_auto_trade_enabled(True, reason=None)
+    bot.reply_to(m, "Trading resumed")
+
+
+@bot.message_handler(commands=['closeall'])
+def closeall(m):
+    if not _require_admin(m):
+        return
+    closed = close_all_positions(reason="MANUAL CLOSE")
+    bot.reply_to(m, f"Closed: {len(closed)}")
+
+
 @bot.message_handler(commands=['start'])
 def start(m):
     pairs_line = ", ".join(PAIRS.keys())
@@ -1843,6 +1901,10 @@ def start(m):
         types.KeyboardButton('/market'),
         types.KeyboardButton('/signal'),
         types.KeyboardButton('/trade'),
+        types.KeyboardButton('/trading'),
+        types.KeyboardButton('/pause'),
+        types.KeyboardButton('/resume'),
+        types.KeyboardButton('/closeall'),
         types.KeyboardButton('/status'),
         types.KeyboardButton('/stats'),
         types.KeyboardButton('/dashboard'),
@@ -1870,11 +1932,16 @@ Pairs: {pairs_line}
 def market(m):
     text = "<b>Market Data:</b>\n\n"
     for pair, ticker in PAIRS.items():
-        data = get_data(ticker)
+        if pair in CRYPTO_PAIRS:
+            data = update_market_data(pair, tf="15m", bars=200, min_age_sec=60)
+        else:
+            data = get_data(ticker)
+
         if data is None or data.empty:
             text += f"{pair}: N/A\n"
             continue
-        ind = get_indicators(data, pair)
+
+        ind = get_indicators(data.tail(200), pair)
         emoji = "UP" if ind['change'] > 0 else "DOWN"
         text += f"{pair}: {fp(pair, ind)} ({emoji} {ind['change']:+.2f}%) RSI:{ind['rsi']:.0f}\n"
     bot.reply_to(m, text, parse_mode='HTML')
@@ -1907,6 +1974,9 @@ def signal(m):
 
 @bot.message_handler(commands=['trade'])
 def trade(m):
+    if not _require_admin(m):
+        return
+
     best = None
     best_count = 0
     
@@ -2112,6 +2182,14 @@ def auto_trade():
 
             try:
                 open_cnt = len([p for p in account.positions if p.get("status") == "OPEN"])
+
+                RUNTIME["auto_trade_last_candidates"] = int(candidates)
+                if sample is not None:
+                    p, s, rs = sample
+                    RUNTIME["auto_trade_last_sample"] = f"{p} {'BUY' if s==1 else 'SELL'}: " + ", ".join(rs)
+                else:
+                    RUNTIME["auto_trade_last_sample"] = None
+
                 msg = f"[AUTO] enabled={enabled} open={open_cnt} candidates={candidates}"
                 if sample is not None:
                     p, s, rs = sample
