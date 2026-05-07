@@ -62,6 +62,7 @@ config_lock = threading.Lock()
 CONFIG_DEFAULTS = {
     "initial_balance": 1000.0,
     "trades_per_pair": 2,
+    "max_total_positions": 10,
     "risk_per_trade": 10.0,
     "leverage": 10,
     "sl_pips": 100,
@@ -1597,6 +1598,57 @@ def _apply_impulse_labels(swings, impulse):
     return out
 
 
+def get_fib_levels(swings, impulse=None):
+    levels = []
+
+    def _add(name, ratio, price, kind):
+        try:
+            levels.append({"name": str(name), "ratio": float(ratio), "price": float(price), "kind": str(kind)})
+        except Exception:
+            pass
+
+    def _from_move(a, b, direction, kind_prefix):
+        a = float(a)
+        b = float(b)
+        move = abs(b - a)
+        if move <= 0:
+            return
+        if direction == 1:
+            base = b
+            for r in [0.236, 0.382, 0.5, 0.618, 0.786]:
+                _add(f"{kind_prefix}R{r:g}", r, base - move * r, "retrace")
+        else:
+            base = b
+            for r in [0.236, 0.382, 0.5, 0.618, 0.786]:
+                _add(f"{kind_prefix}R{r:g}", r, base + move * r, "retrace")
+
+    def _extensions(p2, a, b, direction, kind_prefix):
+        a = float(a)
+        b = float(b)
+        p2 = float(p2)
+        move = abs(b - a)
+        if move <= 0:
+            return
+        if direction == 1:
+            for r in [1.0, 1.272, 1.618, 2.0, 2.618]:
+                _add(f"{kind_prefix}E{r:g}", r, p2 + move * r, "extension")
+        else:
+            for r in [1.0, 1.272, 1.618, 2.0, 2.618]:
+                _add(f"{kind_prefix}E{r:g}", r, p2 - move * r, "extension")
+
+    if impulse and isinstance(impulse, dict) and impulse.get("ok") and impulse.get("points") and impulse.get("direction") in [1, -1]:
+        pts = impulse.get("points") or []
+        if len(pts) >= 3:
+            direction = int(impulse.get("direction") or 0)
+            p0 = float(pts[0].get("price") or 0.0)
+            p1 = float(pts[1].get("price") or 0.0)
+            p2 = float(pts[2].get("price") or 0.0)
+            _from_move(p0, p1, direction, "W1-")
+            _extensions(p2, p0, p1, direction, "W3-")
+
+    return levels
+
+
 def _history_key(ticker, tf):
     return f"{ticker}|{tf}"
 
@@ -1687,6 +1739,10 @@ def apply_config_patch(patch):
         out["trades_per_pair"] = int(float(patch["trades_per_pair"]))
         if out["trades_per_pair"] < 0 or out["trades_per_pair"] > 20:
             raise ValueError("trades_per_pair must be in [0, 20]")
+    if "max_total_positions" in patch:
+        out["max_total_positions"] = int(float(patch["max_total_positions"]))
+        if out["max_total_positions"] < 0 or out["max_total_positions"] > 50:
+            raise ValueError("max_total_positions must be in [0, 50]")
     if "sl_pips" in patch:
         out["sl_pips"] = float(patch["sl_pips"])
         if out["sl_pips"] <= 0:
@@ -2217,10 +2273,15 @@ def auto_trade():
             candidates = 0
             sample = None
 
+            open_total = len([p for p in account.positions if p.get("status") == "OPEN"])
+            max_total = int(CONFIG.get("max_total_positions", 10))
+
             for pair, ticker in PAIRS.items():
                 if len([p for p in account.positions if p['pair'] == pair]) >= trades_per_pair:
                     continue
                 if not enabled:
+                    continue
+                if open_total >= max_total:
                     continue
 
                 sig, sigs, ind15, ind1h = get_intraday_signal(pair, ticker, enforce_hours=False)

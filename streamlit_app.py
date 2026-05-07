@@ -265,6 +265,7 @@ with col_right:
 
     risk_per_trade = st.number_input("Risk per trade (%)", min_value=0.1, max_value=100.0, value=float(cfg["risk_per_trade"]), step=0.1)
     trades_per_pair = st.number_input("Trades per pair", min_value=0, max_value=20, value=int(cfg["trades_per_pair"]), step=1)
+    max_total_positions = st.number_input("Max total positions", min_value=0, max_value=50, value=int(cfg.get("max_total_positions", 10)), step=1)
     sl_pips = st.number_input("SL (pips / $)", min_value=0.01, value=float(cfg["sl_pips"]), step=0.01)
     tp_pips = st.number_input("TP (pips / $)", min_value=0.01, value=float(cfg["tp_pips"]), step=0.01)
     leverage = st.number_input("Leverage", min_value=0.1, max_value=1000.0, value=float(cfg["leverage"]), step=1.0)
@@ -296,6 +297,7 @@ with col_right:
             {
                 "risk_per_trade": risk_per_trade,
                 "trades_per_pair": trades_per_pair,
+                "max_total_positions": max_total_positions,
                 "sl_pips": sl_pips,
                 "tp_pips": tp_pips,
                 "leverage": leverage,
@@ -386,6 +388,17 @@ with col_left:
     else:
         st.info("Plan: —")
 
+    fib_levels = []
+    try:
+        if hasattr(botmod, "get_fib_levels"):
+            fib_levels = botmod.get_fib_levels(swings, impulse)
+    except Exception:
+        fib_levels = []
+
+    if fib_levels:
+        with st.expander("Fibonacci", expanded=False):
+            st.dataframe(pd.DataFrame(fib_levels), width="stretch", hide_index=True)
+
     fig = go.Figure()
     if not df.empty:
         fig.add_trace(
@@ -410,6 +423,17 @@ with col_left:
             texts.append(p.get("label") or "")
 
         fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers+text", text=texts, textposition="top center", name="Waves"))
+
+    if fib_levels and (df is not None) and (not df.empty):
+        x0 = df.index[0]
+        x1 = df.index[-1]
+        for lvl in fib_levels[:12]:
+            try:
+                yv = float(lvl.get("price"))
+            except Exception:
+                continue
+            fig.add_shape(type="line", x0=x0, x1=x1, y0=yv, y1=yv, line=dict(color="rgba(80,80,80,0.35)", width=1, dash="dot"))
+            fig.add_annotation(x=x1, y=yv, text=str(lvl.get("name")), showarrow=False, xanchor="left", font=dict(size=10, color="rgba(80,80,80,0.85)"))
 
     fig.update_layout(height=650, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, width="stretch")
