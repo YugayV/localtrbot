@@ -1,1 +1,2 @@
 web: streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.runOnSave false --server.enableCORS false --server.enableXsrfProtection false --server.fileWatcherType none --browser.gatherUsageStats false
+worker: RUN_HTTP_SERVER=0 python multi_pairs_bot.py

@@ -2381,6 +2381,22 @@ def run_http_server():
     server.serve_forever()
 
 
+def _worker_data_updater():
+    print("[DATA] updater started (worker)", flush=True)
+    while True:
+        try:
+            n = 0
+            for p in sorted(list(CRYPTO_PAIRS or [])):
+                update_market_data(p, tf="15m", bars=1500, min_age_sec=180)
+                update_market_data(p, tf="1h", bars=2000, min_age_sec=300)
+                n += 1
+                time.sleep(0.1)
+            print(f"[DATA] updater cycle ok pairs={n}", flush=True)
+        except Exception as e:
+            print(f"[DATA] updater error: {e}", flush=True)
+        time.sleep(30)
+
+
 def main():
     print("MULTI-PAIRS BOT")
 
@@ -2400,6 +2416,9 @@ def main():
     t1 = threading.Thread(target=auto_trade, daemon=True)
     t1.start()
 
+    t3 = threading.Thread(target=_worker_data_updater, daemon=True)
+    t3.start()
+
     if WEBHOOK_BASE_URL and TELEGRAM_WEBHOOK_SECRET:
         try:
             bot.remove_webhook()
@@ -2417,7 +2436,12 @@ def main():
         t2 = threading.Thread(target=run_bot_polling, daemon=True)
         t2.start()
 
-    run_http_server()
+    if str(os.environ.get("RUN_HTTP_SERVER", "1") or "1").strip().lower() not in ["0", "false", "no", "off"]:
+        run_http_server()
+    else:
+        print("HTTP server disabled (RUN_HTTP_SERVER=0)", flush=True)
+        while True:
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()
