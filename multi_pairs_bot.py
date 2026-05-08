@@ -65,8 +65,10 @@ CONFIG_DEFAULTS = {
     "max_total_positions": 10,
     "risk_per_trade": 10.0,
     "leverage": 10,
-    "sl_pips": 100,
-    "tp_pips": 300,
+    "sl_atr_multiplier": 2.0,
+    "tp_atr_multiplier": 6.0,
+    "trailing_stop": True,
+    "trailing_stop_atr_multiplier": 1.5,
     "check_interval": 60,
     "auto_trade_enabled": True,
     "daily_profit_target_pct": 0.0,
@@ -450,11 +452,17 @@ def fmt_price(pair, price):
     return f"{price:.5f}"
 
 
-def get_sl_tp_distance(pair):
+def get_sl_tp_distance(pair, atr=None):
     with config_lock:
-        sl_pips = float(CONFIG["sl_pips"])
-        tp_pips = float(CONFIG["tp_pips"])
+        sl_atr = float(CONFIG.get("sl_atr_multiplier", 2.0))
+        tp_atr = float(CONFIG.get("tp_atr_multiplier", 6.0))
 
+    if atr is not None and float(atr) > 0:
+        return sl_atr * float(atr), tp_atr * float(atr)
+
+    # Fallback to fixed pips if ATR not available
+    sl_pips = float(CONFIG.get("sl_pips", 100))
+    tp_pips = float(CONFIG.get("tp_pips", 300))
     if pair in CRYPTO_PAIRS:
         return sl_pips, tp_pips
 
@@ -548,6 +556,18 @@ def get_indicators(data, pair_name):
     trend = 1 if closes[-1] > sma else -1
     change = ((closes[-1] - closes[-2]) / closes[-2]) * 100 if len(closes) > 1 else 0
     
+    # Calculate ATR (14-period)
+    tr = []
+    for i in range(1, len(data)):
+        high = highs[i]
+        low = lows[i]
+        prev_close = closes[i-1]
+        tr1 = high - low
+        tr2 = abs(high - prev_close)
+        tr3 = abs(low - prev_close)
+        tr.append(max(tr1, tr2, tr3))
+    atr = np.mean(tr[-14:]) if len(tr) >= 14 else (np.mean(tr) if tr else (highs[-1] - lows[-1]))
+    
     return {
         'price': closes[-1],
         'prev': closes[-2] if len(closes) > 1 else closes[-1],
@@ -555,6 +575,7 @@ def get_indicators(data, pair_name):
         'rsi': rsi,
         'trend': trend,
         'sma': sma,
+        'atr': float(atr),
         'pair': pair_name,
     }
 
@@ -753,10 +774,12 @@ class Account:
         with config_lock:
             risk_pct = 10.0
             leverage = float(CONFIG["leverage"])
-            sl_pips = float(CONFIG["sl_pips"])
+            trailing_stop = bool(CONFIG.get("trailing_stop", True))
+            ts_atr_mult = float(CONFIG.get("trailing_stop_atr_multiplier", 1.5))
 
         risk = self.balance * (risk_pct / 100.0)
-        sl_dist, tp_dist = get_sl_tp_distance(pair)
+        atr = float(ind.get("atr") or 0.0)
+        sl_dist, tp_dist = get_sl_tp_distance(pair, atr=atr)
 
         if direction == 1:
             sl_price = ind['price'] - sl_dist
@@ -765,7 +788,12 @@ class Account:
             sl_price = ind['price'] + sl_dist
             tp_price = ind['price'] - tp_dist
 
-        lot = risk / (max(sl_pips, 0.00001) * 10) * leverage
+        # Calculate lot size
+        sl_pips_fallback = float(CONFIG.get("sl_pips", 100))
+        if atr > 0:
+            lot = risk / (sl_dist * 10) * leverage
+        else:
+            lot = risk / (max(sl_pips_fallback, 0.00001) * 10) * leverage
         lot = max(0.01, min(lot, 1.0))
         
         now_ts = time.time()
@@ -779,7 +807,11 @@ class Account:
             'risk': risk,
             'open_ts': now_ts,
             'time': datetime.now().strftime('%H:%M'),
-            'status': 'OPEN'
+            'status': 'OPEN',
+            'trailing_stop': trailing_stop,
+            'trailing_stop_atr': ts_atr_mult * atr if atr > 0 else None,
+            'highest_since_open': ind['price'] if direction == 1 else None,
+            'lowest_since_open': ind['price'] if direction == -1 else None,
         }
         self.positions.append(pos)
         _append_trade_event(
@@ -808,12 +840,39 @@ class Account:
                 continue
             price = prices[pair]
             with config_lock:
-                sl_pips = float(CONFIG["sl_pips"])
-                tp_pips = float(CONFIG["tp_pips"])
-            
+                sl_pips = float(CONFIG.get("sl_pips", 100))
+                tp_pips = float(CONFIG.get("tp_pips", 300))
+
+            # Update trailing stop
+            if pos.get("trailing_stop"):
+                if pos['direction'] == 1:
+                    # Update highest since open
+                    if pos.get("highest_since_open") is None or price > pos["highest_since_open"]:
+                        pos["highest_since_open"] = price
+                    # Move SL up if trailing stop triggered
+                    ts_dist = pos.get("trailing_stop_atr")
+                    if ts_dist is not None:
+                        new_sl = pos["highest_since_open"] - ts_dist
+                        if new_sl > pos["sl"]:
+                            pos["sl"] = new_sl
+                else:
+                    # Update lowest since open
+                    if pos.get("lowest_since_open") is None or price < pos["lowest_since_open"]:
+                        pos["lowest_since_open"] = price
+                    # Move SL down if trailing stop triggered
+                    ts_dist = pos.get("trailing_stop_atr")
+                    if ts_dist is not None:
+                        new_sl = pos["lowest_since_open"] + ts_dist
+                        if new_sl < pos["sl"]:
+                            pos["sl"] = new_sl
+
+            # Check TP/SL
             if pos['direction'] == 1:
                 if price >= pos['tp']:
-                    pnl = pos['risk'] * (tp_pips / sl_pips)
+                    # Use ATR multipliers for RR if available
+                    sl_mult = float(CONFIG.get("sl_atr_multiplier", 2.0))
+                    tp_mult = float(CONFIG.get("tp_atr_multiplier", 6.0))
+                    pnl = pos['risk'] * (tp_mult / sl_mult)
                     pos['status'] = 'WIN'
                     pos['pnl'] = pnl
                     self.balance += pnl
@@ -825,7 +884,10 @@ class Account:
                     closed.append(pos)
             else:
                 if price <= pos['tp']:
-                    pnl = pos['risk'] * (tp_pips / sl_pips)
+                    # Use ATR multipliers for RR if available
+                    sl_mult = float(CONFIG.get("sl_atr_multiplier", 2.0))
+                    tp_mult = float(CONFIG.get("tp_atr_multiplier", 6.0))
+                    pnl = pos['risk'] * (tp_mult / sl_mult)
                     pos['status'] = 'WIN'
                     pos['pnl'] = pnl
                     self.balance += pnl
@@ -1743,6 +1805,20 @@ def apply_config_patch(patch):
         out["max_total_positions"] = int(float(patch["max_total_positions"]))
         if out["max_total_positions"] < 0 or out["max_total_positions"] > 50:
             raise ValueError("max_total_positions must be in [0, 50]")
+    if "sl_atr_multiplier" in patch:
+        out["sl_atr_multiplier"] = float(patch["sl_atr_multiplier"])
+        if out["sl_atr_multiplier"] <= 0 or out["sl_atr_multiplier"] > 20:
+            raise ValueError("sl_atr_multiplier must be in (0, 20]")
+    if "tp_atr_multiplier" in patch:
+        out["tp_atr_multiplier"] = float(patch["tp_atr_multiplier"])
+        if out["tp_atr_multiplier"] <= 0 or out["tp_atr_multiplier"] > 50:
+            raise ValueError("tp_atr_multiplier must be in (0, 50]")
+    if "trailing_stop" in patch:
+        out["trailing_stop"] = to_bool(patch["trailing_stop"])
+    if "trailing_stop_atr_multiplier" in patch:
+        out["trailing_stop_atr_multiplier"] = float(patch["trailing_stop_atr_multiplier"])
+        if out["trailing_stop_atr_multiplier"] <= 0 or out["trailing_stop_atr_multiplier"] > 20:
+            raise ValueError("trailing_stop_atr_multiplier must be in (0, 20]")
     if "sl_pips" in patch:
         out["sl_pips"] = float(patch["sl_pips"])
         if out["sl_pips"] <= 0:

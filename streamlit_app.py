@@ -14,86 +14,8 @@ st.set_page_config(page_title="LocalTRBot", layout="wide")
 
 @st.cache_resource
 def _start_background():
-    started_at = time.time()
-    auto_restart_hourly = str(os.environ.get("AUTO_RESTART_HOURLY", "1") or "1").strip().lower() not in ["0", "false", "no", "off"]
-
-    def _run_auto():
-        print("[AUTO] thread started", flush=True)
-        while True:
-            try:
-                botmod.auto_trade()
-            except BaseException as e:
-                try:
-                    botmod.RUNTIME["auto_trade_last_error"] = str(e)
-                except Exception:
-                    pass
-                print(f"[AUTO] crashed: {e}", flush=True)
-                time.sleep(5)
-
-    def _run_poll():
-        print("[TG] polling thread started", flush=True)
-        while True:
-            try:
-                try:
-                    botmod.bot.remove_webhook()
-                except Exception:
-                    pass
-                botmod.run_bot_polling()
-            except BaseException as e:
-                try:
-                    botmod.RUNTIME["bot_poll_last_error"] = str(e)
-                except Exception:
-                    pass
-                print(f"[TG] crashed: {e}", flush=True)
-                time.sleep(5)
-
-    def _run_data_updater():
-        print("[DATA] updater started", flush=True)
-        while True:
-            try:
-                n = 0
-                for p in sorted(list(getattr(botmod, "CRYPTO_PAIRS", []) or [])):
-                    botmod.update_market_data(p, tf="15m", bars=1500, min_age_sec=180)
-                    botmod.update_market_data(p, tf="1h", bars=2000, min_age_sec=300)
-                    n += 1
-                    time.sleep(0.1)
-                print(f"[DATA] updater cycle ok pairs={n}", flush=True)
-            except Exception as e:
-                print(f"[DATA] updater error: {e}", flush=True)
-            time.sleep(30)
-
-    t1 = threading.Thread(target=_run_auto, daemon=True)
-    t1.start()
-
-    t2 = threading.Thread(target=_run_poll, daemon=True)
-    t2.start()
-
-    t3 = threading.Thread(target=_run_data_updater, daemon=True)
-    t3.start()
-
-    def _run_watchdog():
-        print("[WD] watchdog started", flush=True)
-        while True:
-            try:
-                if auto_restart_hourly and (time.time() - started_at) >= 3600:
-                    try:
-                        botmod.account.save_state()
-                    except Exception:
-                        pass
-                    try:
-                        botmod.save_config(botmod.CONFIG)
-                    except Exception:
-                        pass
-                    print("[WD] hourly restart", flush=True)
-                    os._exit(0)
-            except Exception:
-                pass
-            time.sleep(10)
-
-    t4 = threading.Thread(target=_run_watchdog, daemon=True)
-    t4.start()
-
-    return {"started_at": started_at, "auto_thread": t1, "poll_thread": t2, "data_thread": t3, "watchdog_thread": t4}
+    print("[DASH] Streamlit dashboard mode: no bot logic running here", flush=True)
+    return {"started_at": time.time()}
 
 
 def _get_positions_df():
@@ -185,15 +107,8 @@ if st.button("Refresh data", width="stretch"):
     st.cache_data.clear()
     st.rerun()
 
-auto_alive = bool(bg.get("auto_thread")) and bg["auto_thread"].is_alive()
-poll_alive = bool(bg.get("poll_thread")) and bg["poll_thread"].is_alive()
-data_alive = bool(bg.get("data_thread")) and bg["data_thread"].is_alive()
-rt = getattr(botmod, "RUNTIME", {}) or {}
-
 st.caption(
-    f"Background: auto={auto_alive} polling={poll_alive} data={data_alive} | "
-    f"last_loop={_fmt_ts(rt.get('auto_trade_last_loop_ts'))} | "
-    f"last_cycle={_fmt_ts(rt.get('auto_trade_last_cycle_ts'))} | "
+    "Dashboard mode: bot logic runs in separate worker process | "
     f"last_open={_fmt_ts(rt.get('auto_trade_last_open_ts'))} {rt.get('auto_trade_last_open_pair') or ''}"
 )
 
@@ -261,17 +176,22 @@ with col_right:
         st.success(f"Closed: {len(closed)}")
         st.rerun()
 
-    st.subheader("Risk & Profit")
+    st.subheader("Risk Management (ATR-based)")
+    c1, c2 = st.columns(2)
+    with c1:
+        risk_per_trade = st.number_input("Risk per trade (%)", min_value=0.1, max_value=100.0, value=float(cfg["risk_per_trade"]), step=0.1)
+        trades_per_pair = st.number_input("Trades per pair", min_value=0, max_value=20, value=int(cfg["trades_per_pair"]), step=1)
+        max_total_positions = st.number_input("Max total positions", min_value=0, max_value=50, value=int(cfg.get("max_total_positions", 10)), step=1)
+        sl_atr_multiplier = st.number_input("Stop loss (ATR x)", min_value=0.1, max_value=20.0, value=float(cfg.get("sl_atr_multiplier", 2.0)), step=0.1)
+        tp_atr_multiplier = st.number_input("Take profit (ATR x)", min_value=0.1, max_value=50.0, value=float(cfg.get("tp_atr_multiplier", 6.0)), step=0.1)
+    with c2:
+        trailing_stop = st.selectbox("Trailing stop", ["true", "false"], index=0 if bool(cfg.get("trailing_stop", True)) else 1)
+        trailing_stop_atr_multiplier = st.number_input("Trailing stop (ATR x)", min_value=0.1, max_value=20.0, value=float(cfg.get("trailing_stop_atr_multiplier", 1.5)), step=0.1)
+        leverage = st.number_input("Leverage", min_value=0.1, max_value=1000.0, value=float(cfg["leverage"]), step=1.0)
+        check_interval = st.number_input("Check interval (sec)", min_value=5, value=int(cfg["check_interval"]), step=5)
+        auto_trade_enabled = st.selectbox("Auto-trade enabled", ["true", "false"], index=0 if bool(cfg["auto_trade_enabled"]) else 1)
 
-    risk_per_trade = st.number_input("Risk per trade (%)", min_value=0.1, max_value=100.0, value=float(cfg["risk_per_trade"]), step=0.1)
-    trades_per_pair = st.number_input("Trades per pair", min_value=0, max_value=20, value=int(cfg["trades_per_pair"]), step=1)
-    max_total_positions = st.number_input("Max total positions", min_value=0, max_value=50, value=int(cfg.get("max_total_positions", 10)), step=1)
-    sl_pips = st.number_input("SL (pips / $)", min_value=0.01, value=float(cfg["sl_pips"]), step=0.01)
-    tp_pips = st.number_input("TP (pips / $)", min_value=0.01, value=float(cfg["tp_pips"]), step=0.01)
-    leverage = st.number_input("Leverage", min_value=0.1, max_value=1000.0, value=float(cfg["leverage"]), step=1.0)
-    check_interval = st.number_input("Check interval (sec)", min_value=5, value=int(cfg["check_interval"]), step=5)
-    auto_trade_enabled = st.selectbox("Auto-trade enabled", ["true", "false"], index=0 if bool(cfg["auto_trade_enabled"]) else 1)
-
+    st.subheader("Daily Limits")
     daily_profit_target_pct = st.number_input(
         "Daily profit target (%)",
         min_value=0.0,
@@ -298,8 +218,10 @@ with col_right:
                 "risk_per_trade": risk_per_trade,
                 "trades_per_pair": trades_per_pair,
                 "max_total_positions": max_total_positions,
-                "sl_pips": sl_pips,
-                "tp_pips": tp_pips,
+                "sl_atr_multiplier": sl_atr_multiplier,
+                "tp_atr_multiplier": tp_atr_multiplier,
+                "trailing_stop": trailing_stop,
+                "trailing_stop_atr_multiplier": trailing_stop_atr_multiplier,
                 "leverage": leverage,
                 "check_interval": check_interval,
                 "auto_trade_enabled": auto_trade_enabled,
