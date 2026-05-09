@@ -84,6 +84,8 @@ CONFIG_DEFAULTS = {
     "deepseek_ttl_sec": 300,
     "deepseek_min_local_score": 45,
     "deepseek_min_confidence": 0.6,
+
+    "backtest_commission_bps": 0.0,
 }
 
 
@@ -657,6 +659,175 @@ def _clip(x, lo, hi):
         return float(lo)
 
 
+def _macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    fast = int(fast)
+    slow = int(slow)
+    signal = int(signal)
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    line = ema_fast - ema_slow
+    sig = line.ewm(span=signal, adjust=False).mean()
+    hist = line - sig
+    return line, sig, hist
+
+
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    h = df["High"].astype(float)
+    l = df["Low"].astype(float)
+    c = df["Close"].astype(float)
+    pc = c.shift(1)
+    tr = pd.concat([(h - l).abs(), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    return tr.rolling(int(period)).mean()
+
+
+def _goya_score_local(df15: pd.DataFrame, ind15: dict, ind1h: dict | None, p_up: float | None):
+    rsi15 = float(ind15.get("rsi") or 50.0)
+    trend15 = int(ind15.get("trend") or 0)
+    change = float(ind15.get("change") or 0.0)
+
+    vol20 = None
+    try:
+        close = df15["Close"].astype(float)
+        vol20 = float(close.pct_change().rolling(20).std().iloc[-1])
+    except Exception:
+        vol20 = None
+
+    vol_scale = 1.0
+    if vol20 is not None and vol20 >= 0:
+        vol_scale = 1.0 / (1.0 + (vol20 * 40.0))
+
+    c_rsi = _clip((rsi15 - 50.0) / 25.0, -1.0, 1.0)
+    c_trend15 = 1.0 if trend15 == 1 else (-1.0 if trend15 == -1 else 0.0)
+    c_mom = float(np.tanh(change / 0.03))
+
+    c_trend1h = 0.0
+    if ind1h is not None:
+        t1h = int(ind1h.get("trend") or 0)
+        c_trend1h = 1.0 if t1h == 1 else (-1.0 if t1h == -1 else 0.0)
+
+    c_model = 0.0
+    has_model = False
+    if p_up is not None:
+        try:
+            c_model = _clip((float(p_up) - 0.5) * 2.0, -1.0, 1.0)
+            has_model = True
+        except Exception:
+            c_model = 0.0
+            has_model = False
+
+    w_sum = 0.0
+    s_sum = 0.0
+    parts = []
+
+    def add(name, w, val):
+        nonlocal w_sum, s_sum
+        w = float(w)
+        val = float(val)
+        parts.append({"name": name, "w": w, "v": val})
+        w_sum += abs(w)
+        s_sum += w * val
+
+    add("mom", 1.0, c_mom)
+    add("rsi", 1.0, c_rsi)
+    add("trend15", 1.0, c_trend15)
+    add("trend1h", 0.6, c_trend1h)
+    if has_model:
+        add("model", 1.2, c_model)
+
+    raw = (s_sum / w_sum) if w_sum else 0.0
+    score = int(round(_clip(raw * 100.0 * vol_scale, -100.0, 100.0)))
+    return {"score": score, "vol20": float(vol20) if vol20 is not None else None, "parts": parts}
+
+
+_DEEPSEEK_LOCK = threading.Lock()
+_DEEPSEEK_CACHE = {}
+
+
+def _deepseek_score(pair, tf_norm, ind15, ind1h, local_score):
+    with config_lock:
+        enabled = bool(CONFIG.get("deepseek_enabled", False))
+        model = str(CONFIG.get("deepseek_model", "deepseek-v4-flash") or "deepseek-v4-flash")
+        timeout = float(CONFIG.get("deepseek_timeout_sec", 10) or 10)
+        ttl = int(CONFIG.get("deepseek_ttl_sec", 300) or 300)
+        min_local = int(CONFIG.get("deepseek_min_local_score", 45) or 45)
+
+    if not enabled or (not DEEPSEEK_API_KEY) or abs(int(local_score)) < int(min_local):
+        return None
+
+    now = time.time()
+    key = f"{pair}|{tf_norm}"
+    with _DEEPSEEK_LOCK:
+        hit = _DEEPSEEK_CACHE.get(key)
+        if hit and (now - float(hit.get("ts") or 0)) < ttl:
+            return hit.get("data")
+
+    with config_lock:
+        min_conf = float(CONFIG.get("deepseek_min_confidence", 0.6) or 0.6)
+
+    req_body = {
+        "model": model,
+        "thinking": {"type": "disabled"},
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
+        "max_tokens": 220,
+        "stream": False,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Верни ТОЛЬКО JSON: {\"score\":-100..100,\"dir\":-1|0|1,\"confidence\":0..1,\"reasons\":[строки]}.",
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "pair": pair,
+                        "tf": tf_norm,
+                        "local_score": int(local_score),
+                        "rsi15": float(ind15.get("rsi") or 0.0),
+                        "trend15": int(ind15.get("trend") or 0),
+                        "change": float(ind15.get("change") or 0.0),
+                        "atr": float(ind15.get("atr") or 0.0),
+                        "rsi1h": float(ind1h.get("rsi") or 0.0) if ind1h else None,
+                        "trend1h": int(ind1h.get("trend") or 0) if ind1h else None,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+    }
+
+    try:
+        req = urllib.request.Request(
+            "https://api.deepseek.com/chat/completions",
+            data=json.dumps(req_body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", errors="ignore")
+        resp = json.loads(raw)
+        txt = (((resp.get("choices") or [{}])[0]).get("message") or {}).get("content")
+        data = json.loads(txt) if isinstance(txt, str) else None
+        if not isinstance(data, dict):
+            return None
+
+        score = int(_clip(float(data.get("score") or 0), -100, 100))
+        d = int(float(data.get("dir") or 0))
+        if d not in (-1, 0, 1):
+            d = 0
+        conf = float(_clip(float(data.get("confidence") or 0.0), 0.0, 1.0))
+        reasons = data.get("reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+
+        out = {"score": score, "dir": d, "confidence": conf, "min_conf": float(min_conf), "reasons": [str(x) for x in reasons][:6]}
+        with _DEEPSEEK_LOCK:
+            _DEEPSEEK_CACHE[key] = {"ts": now, "data": out}
+        return out
+    except Exception:
+        return None
+
+
 def _goya_score_local(pair, df15, ind15, ind1h, p_up=None):
     rsi15 = float(ind15.get("rsi") or 50.0)
     trend15 = int(ind15.get("trend") or 0)
@@ -817,6 +988,354 @@ def _deepseek_goya_score(pair, tf_norm, ind15, ind1h, local_score):
         return None
 
 
+def backtest_macd_rsi(df: pd.DataFrame, rsi_min: float = 50.0, macd_fast: int = 12, macd_slow: int = 26, macd_signal: int = 9, sl_atr_mult: float = 2.0, tp_atr_mult: float = 6.0, trailing_atr_mult: float | None = None, commission_bps: float = 0.0):
+    df = df.copy()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if df.empty or len(df) < 60:
+        return {"equity": [], "trades": [], "error": "not enough data"}
+
+    close = df["Close"].astype(float)
+    macd_line, macd_sig, _ = _macd(close, fast=int(macd_fast), slow=int(macd_slow), signal=int(macd_signal))
+    rsi = _rsi_series(close, 14)
+    atr = _atr(df, 14)
+
+    equity = 100.0
+    eq = []
+    trades = []
+
+    in_pos = False
+    entry = 0.0
+    sl = 0.0
+    tp = 0.0
+    peak = 0.0
+
+    for i in range(2, len(df)):
+        ts = df.index[i]
+        px = float(close.iloc[i])
+        eq.append({"t": ts, "equity": float(equity)})
+
+        if not in_pos:
+            cross_up = float(macd_line.iloc[i - 1]) <= float(macd_sig.iloc[i - 1]) and float(macd_line.iloc[i]) > float(macd_sig.iloc[i])
+            if cross_up and float(rsi.iloc[i]) > float(rsi_min) and float(atr.iloc[i] or 0) > 0:
+                in_pos = True
+                entry = px
+                sl = entry - (float(sl_atr_mult) * float(atr.iloc[i]))
+                tp = entry + (float(tp_atr_mult) * float(atr.iloc[i]))
+                peak = entry
+                trades.append({"direction": 1, "open_t": ts, "entry": entry, "sl": sl, "tp": tp, "close_t": None, "exit": None, "pnl": 0.0, "status": "OPEN", "exit_reason": None})
+            continue
+
+        if px > peak:
+            peak = px
+        if trailing_atr_mult is not None and float(atr.iloc[i] or 0) > 0:
+            tsl = float(peak) - (float(trailing_atr_mult) * float(atr.iloc[i]))
+            if tsl > sl:
+                sl = tsl
+
+        exit_now = False
+        exit_reason = None
+
+        if px <= sl:
+            exit_now = True
+            exit_reason = "SL"
+        elif px >= tp:
+            exit_now = True
+            exit_reason = "TP"
+        else:
+            cross_dn = float(macd_line.iloc[i - 1]) >= float(macd_sig.iloc[i - 1]) and float(macd_line.iloc[i]) < float(macd_sig.iloc[i])
+            if cross_dn:
+                exit_now = True
+                exit_reason = "MACD"
+
+        if exit_now:
+            risk = 10.0
+            sl_dist = max(entry - sl, 1e-9)
+            rr = (px - entry) / sl_dist
+            pnl = risk * rr
+            pnl = max(-risk, min(pnl, risk * (float(tp_atr_mult) / max(float(sl_atr_mult), 1e-9))))
+
+            fees = float(commission_bps) / 10000.0
+            if fees > 0:
+                pnl -= abs(pnl) * fees
+
+            equity += pnl
+
+            t = trades[-1]
+            t["close_t"] = ts
+            t["exit"] = px
+            t["pnl"] = float(pnl)
+            t["status"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+            t["exit_reason"] = exit_reason
+
+            in_pos = False
+            entry = 0.0
+            sl = 0.0
+            tp = 0.0
+            peak = 0.0
+
+    if eq and eq[-1]["t"] != df.index[-1]:
+        eq.append({"t": df.index[-1], "equity": float(equity)})
+
+    return {"equity": eq, "trades": trades}
+
+
+def backtest_metrics(result: dict):
+    eq = result.get("equity") or []
+    trades = result.get("trades") or []
+    if not eq:
+        return {"ok": False, "error": str(result.get("error") or "no equity")}
+
+    equity = np.array([float(x.get("equity") or 0.0) for x in eq], dtype=float)
+    if len(equity) < 2:
+        return {"ok": False, "error": "too short"}
+
+    rets = np.diff(equity) / np.maximum(equity[:-1], 1e-9)
+
+    total_return_pct = float((equity[-1] / max(equity[0], 1e-9) - 1.0) * 100.0)
+    peak = np.maximum.accumulate(equity)
+    dd = (peak - equity) / np.maximum(peak, 1e-9)
+    max_dd_pct = float(dd.max() * 100.0)
+
+    closed = [t for t in trades if t.get("status") in ["WIN", "LOSS", "FLAT"]]
+    wins = [t for t in closed if t.get("status") == "WIN"]
+    losses = [t for t in closed if t.get("status") == "LOSS"]
+
+    win_rate_pct = float(len(wins) / len(closed) * 100.0) if closed else 0.0
+
+    gp = float(sum(float(t.get("pnl") or 0.0) for t in wins))
+    gl = float(-sum(float(t.get("pnl") or 0.0) for t in losses))
+    profit_factor = float(gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
+
+    mu = float(np.mean(rets)) if len(rets) else 0.0
+    sd = float(np.std(rets)) if len(rets) else 0.0
+    sharpe = float((mu / sd) * np.sqrt(252)) if sd > 0 else 0.0
+
+    neg = rets[rets < 0]
+    ddn = float(np.std(neg)) if len(neg) else 0.0
+    sortino = float((mu / ddn) * np.sqrt(252)) if ddn > 0 else 0.0
+
+    return {
+        "ok": True,
+        "total_return_pct": total_return_pct,
+        "max_dd_pct": max_dd_pct,
+        "trades": int(len(closed)),
+        "win_rate_pct": win_rate_pct,
+        "profit_factor": profit_factor,
+        "sharpe": sharpe,
+        "sortino": sortino,
+    }
+
+
+def optimize_macd_rsi(df: pd.DataFrame, commission_bps: float = 0.0, top_n: int = 5):
+    rsi_mins = [45, 50, 55]
+    macd_sets = [(12, 26, 9), (8, 21, 5), (5, 35, 5)]
+    sl_mults = [1.5, 2.0, 2.5]
+    tp_mults = [4.0, 6.0, 8.0]
+    trailing_mults = [None, 2.0, 3.0]
+
+    out = []
+    for rsi_min in rsi_mins:
+        for f, s, si in macd_sets:
+            for sl in sl_mults:
+                for tp in tp_mults:
+                    for tr in trailing_mults:
+                        bt = backtest_macd_rsi(
+                            df,
+                            rsi_min=float(rsi_min),
+                            macd_fast=int(f),
+                            macd_slow=int(s),
+                            macd_signal=int(si),
+                            sl_atr_mult=float(sl),
+                            tp_atr_mult=float(tp),
+                            trailing_atr_mult=(float(tr) if tr is not None else None),
+                            commission_bps=float(commission_bps),
+                        )
+                        mt = backtest_metrics(bt)
+                        if not mt.get("ok"):
+                            continue
+                        out.append({"strategy": "MACD_RSI", "rsi_min": int(rsi_min), "macd": f"{f},{s},{si}", "sl_atr": float(sl), "tp_atr": float(tp), "trail_atr": tr, **mt})
+
+    out.sort(key=lambda x: (float(x.get("sortino") or 0.0), float(x.get("total_return_pct") or 0.0)), reverse=True)
+    return out[: int(top_n)]
+
+
+def _bbands(close: pd.Series, period: int = 20, mult: float = 2.0):
+    p = int(period)
+    m = float(mult)
+    ma = close.rolling(p).mean()
+    sd = close.rolling(p).std()
+    up = ma + (m * sd)
+    lo = ma - (m * sd)
+    return ma, up, lo
+
+
+def backtest_bbands_meanrev(df: pd.DataFrame, bb_period: int = 20, bb_mult: float = 2.0, rsi_low: float = 40.0, rsi_high: float = 60.0, sl_atr_mult: float = 2.0, tp_atr_mult: float = 4.0, trailing_atr_mult: float | None = None, commission_bps: float = 0.0):
+    df = df.copy()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if df.empty or len(df) < 80:
+        return {"equity": [], "trades": [], "error": "not enough data"}
+
+    close = df["Close"].astype(float)
+    rsi = _rsi_series(close, 14)
+    atr = _atr(df, 14)
+    mid, up, lo = _bbands(close, period=int(bb_period), mult=float(bb_mult))
+
+    equity = 100.0
+    eq = []
+    trades = []
+
+    in_pos = False
+    direction = 0
+    entry = 0.0
+    sl = 0.0
+    tp = 0.0
+    peak = 0.0
+
+    for i in range(2, len(df)):
+        ts = df.index[i]
+        px = float(close.iloc[i])
+        eq.append({"t": ts, "equity": float(equity)})
+
+        a = float(atr.iloc[i] or 0.0)
+        if a <= 0:
+            continue
+
+        if not in_pos:
+            if float(close.iloc[i]) < float(lo.iloc[i]) and float(rsi.iloc[i]) < float(rsi_low):
+                in_pos = True
+                direction = 1
+                entry = px
+                sl = entry - (float(sl_atr_mult) * a)
+                tp = entry + (float(tp_atr_mult) * a)
+                peak = entry
+                trades.append({"direction": 1, "open_t": ts, "entry": entry, "sl": sl, "tp": tp, "close_t": None, "exit": None, "pnl": 0.0, "status": "OPEN", "exit_reason": None})
+                continue
+            if float(close.iloc[i]) > float(up.iloc[i]) and float(rsi.iloc[i]) > float(rsi_high):
+                in_pos = True
+                direction = -1
+                entry = px
+                sl = entry + (float(sl_atr_mult) * a)
+                tp = entry - (float(tp_atr_mult) * a)
+                peak = entry
+                trades.append({"direction": -1, "open_t": ts, "entry": entry, "sl": sl, "tp": tp, "close_t": None, "exit": None, "pnl": 0.0, "status": "OPEN", "exit_reason": None})
+                continue
+            continue
+
+        if direction == 1:
+            if px > peak:
+                peak = px
+            if trailing_atr_mult is not None:
+                tsl = float(peak) - (float(trailing_atr_mult) * a)
+                if tsl > sl:
+                    sl = tsl
+        else:
+            if px < peak:
+                peak = px
+            if trailing_atr_mult is not None:
+                tsl = float(peak) + (float(trailing_atr_mult) * a)
+                if tsl < sl:
+                    sl = tsl
+
+        exit_now = False
+        exit_reason = None
+
+        if direction == 1:
+            if px <= sl:
+                exit_now = True
+                exit_reason = "SL"
+            elif px >= tp:
+                exit_now = True
+                exit_reason = "TP"
+            elif float(px) >= float(mid.iloc[i]):
+                exit_now = True
+                exit_reason = "MID"
+        else:
+            if px >= sl:
+                exit_now = True
+                exit_reason = "SL"
+            elif px <= tp:
+                exit_now = True
+                exit_reason = "TP"
+            elif float(px) <= float(mid.iloc[i]):
+                exit_now = True
+                exit_reason = "MID"
+
+        if exit_now:
+            risk = 10.0
+            if direction == 1:
+                sl_dist = max(entry - sl, 1e-9)
+                rr = (px - entry) / sl_dist
+            else:
+                sl_dist = max(sl - entry, 1e-9)
+                rr = (entry - px) / sl_dist
+
+            pnl = risk * rr
+            pnl = max(-risk, min(pnl, risk * (float(tp_atr_mult) / max(float(sl_atr_mult), 1e-9))))
+
+            fees = float(commission_bps) / 10000.0
+            if fees > 0:
+                pnl -= abs(pnl) * fees
+
+            equity += pnl
+
+            t = trades[-1]
+            t["close_t"] = ts
+            t["exit"] = px
+            t["pnl"] = float(pnl)
+            t["status"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+            t["exit_reason"] = exit_reason
+
+            in_pos = False
+            direction = 0
+            entry = 0.0
+            sl = 0.0
+            tp = 0.0
+            peak = 0.0
+
+    if eq and eq[-1]["t"] != df.index[-1]:
+        eq.append({"t": df.index[-1], "equity": float(equity)})
+
+    return {"equity": eq, "trades": trades}
+
+
+def optimize_bbands_meanrev(df: pd.DataFrame, commission_bps: float = 0.0, top_n: int = 5):
+    bb_periods = [20]
+    bb_mults = [1.5, 2.0, 2.5]
+    rsi_lows = [35, 40, 45]
+    rsi_highs = [55, 60, 65]
+    sl_mults = [1.5, 2.0, 2.5]
+    tp_mults = [3.0, 4.0, 6.0]
+    trailing_mults = [None, 2.0, 3.0]
+
+    out = []
+    for p in bb_periods:
+        for bm in bb_mults:
+            for rl in rsi_lows:
+                for rh in rsi_highs:
+                    for sl in sl_mults:
+                        for tp in tp_mults:
+                            for tr in trailing_mults:
+                                bt = backtest_bbands_meanrev(
+                                    df,
+                                    bb_period=int(p),
+                                    bb_mult=float(bm),
+                                    rsi_low=float(rl),
+                                    rsi_high=float(rh),
+                                    sl_atr_mult=float(sl),
+                                    tp_atr_mult=float(tp),
+                                    trailing_atr_mult=(float(tr) if tr is not None else None),
+                                    commission_bps=float(commission_bps),
+                                )
+                                mt = backtest_metrics(bt)
+                                if not mt.get("ok"):
+                                    continue
+                                out.append({"strategy": "BB_MEANREV", "bb_period": int(p), "bb_mult": float(bm), "rsi_low": float(rl), "rsi_high": float(rh), "sl_atr": float(sl), "tp_atr": float(tp), "trail_atr": tr, **mt})
+
+    out.sort(key=lambda x: (float(x.get("sortino") or 0.0), float(x.get("total_return_pct") or 0.0)), reverse=True)
+    return out[: int(top_n)]
+
+
+
 def check_signal(ind, enforce_hours=True):
     signals = []
     rsi = ind['rsi']
@@ -971,9 +1490,9 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
         ind15["goya_score"] = sc
         v20 = gs.get("vol20") if gs else None
         if v20 is not None:
-            reasons.append(f"GoyaScore: {sc:+d} vol20={float(v20)*100:.2f}%")
+            reasons.append(f"VitalityScore: {sc:+d} vol20={float(v20)*100:.2f}%")
         else:
-            reasons.append(f"GoyaScore: {sc:+d}")
+            reasons.append(f"VitalityScore: {sc:+d}")
 
         with config_lock:
             goya_on = bool(CONFIG.get("goya_score_enabled", True))
@@ -2148,6 +2667,48 @@ def apply_config_patch(patch):
     if "close_positions_on_stop" in patch:
         out["close_positions_on_stop"] = to_bool(patch["close_positions_on_stop"])
 
+    if "goya_score_enabled" in patch:
+        out["goya_score_enabled"] = to_bool(patch["goya_score_enabled"])
+
+    if "goya_min_score" in patch:
+        out["goya_min_score"] = int(float(patch["goya_min_score"]))
+        if out["goya_min_score"] < 0 or out["goya_min_score"] > 100:
+            raise ValueError("goya_min_score must be in [0, 100]")
+
+    if "goya_rank_candidates" in patch:
+        out["goya_rank_candidates"] = to_bool(patch["goya_rank_candidates"])
+
+    if "deepseek_enabled" in patch:
+        out["deepseek_enabled"] = to_bool(patch["deepseek_enabled"])
+
+    if "deepseek_model" in patch:
+        out["deepseek_model"] = str(patch["deepseek_model"] or "").strip() or "deepseek-v4-flash"
+
+    if "deepseek_timeout_sec" in patch:
+        out["deepseek_timeout_sec"] = float(patch["deepseek_timeout_sec"])
+        if out["deepseek_timeout_sec"] < 1 or out["deepseek_timeout_sec"] > 60:
+            raise ValueError("deepseek_timeout_sec must be in [1, 60]")
+
+    if "deepseek_ttl_sec" in patch:
+        out["deepseek_ttl_sec"] = int(float(patch["deepseek_ttl_sec"]))
+        if out["deepseek_ttl_sec"] < 0 or out["deepseek_ttl_sec"] > 86400:
+            raise ValueError("deepseek_ttl_sec must be in [0, 86400]")
+
+    if "deepseek_min_local_score" in patch:
+        out["deepseek_min_local_score"] = int(float(patch["deepseek_min_local_score"]))
+        if out["deepseek_min_local_score"] < 0 or out["deepseek_min_local_score"] > 100:
+            raise ValueError("deepseek_min_local_score must be in [0, 100]")
+
+    if "deepseek_min_confidence" in patch:
+        out["deepseek_min_confidence"] = float(patch["deepseek_min_confidence"])
+        if out["deepseek_min_confidence"] < 0 or out["deepseek_min_confidence"] > 1:
+            raise ValueError("deepseek_min_confidence must be in [0, 1]")
+
+    if "backtest_commission_bps" in patch:
+        out["backtest_commission_bps"] = float(patch["backtest_commission_bps"])
+        if out["backtest_commission_bps"] < 0 or out["backtest_commission_bps"] > 200:
+            raise ValueError("backtest_commission_bps must be in [0, 200]")
+
     with config_lock:
         CONFIG.update(out)
         save_config(CONFIG)
@@ -2405,6 +2966,8 @@ def start(m):
     kb.add(
         types.KeyboardButton('/market'),
         types.KeyboardButton('/signal'),
+        types.KeyboardButton('/ai'),
+        types.KeyboardButton('/backtest'),
         types.KeyboardButton('/trade'),
         types.KeyboardButton('/trading'),
         types.KeyboardButton('/pause'),
@@ -2456,7 +3019,7 @@ def signal(m):
     text = "<b>Signals:</b>\n\n"
     best = None
     best_count = 0
-    
+
     for pair, ticker in PAIRS.items():
         sig, sigs, ind15, ind1h = get_intraday_signal(pair, ticker, enforce_hours=False)
         if ind15 is None:
@@ -2465,17 +3028,99 @@ def signal(m):
         if sig != 0:
             direction = "BUY" if sig == 1 else "SELL"
             conf = "UP" if (ind1h and ind1h.get('trend') == 1) else "DOWN" if (ind1h and ind1h.get('trend') == -1) else "N/A"
-            text += f"{pair}: <b>{direction}</b> TF:15m RSI:{ind15['rsi']:.0f} | 1h:{conf}\n"
+            gs = None
+            try:
+                gs = int(ind15.get("goya_score"))
+            except Exception:
+                gs = None
+            gs_txt = f" Vitality:{gs:+d}" if isinstance(gs, int) else ""
+            text += f"{pair}: <b>{direction}</b> TF:15m RSI:{ind15['rsi']:.0f} | 1h:{conf}{gs_txt}\n"
             if len(sigs) > best_count:
                 best_count = len(sigs)
                 best = (pair, sig, ind15, sigs)
-    
+
     if best:
         pair, sig, ind, sigs = best
         text += f"\n<b>BEST: {pair}</b>\n"
         text += f"Entry: {fp(pair, ind)}\n"
-    
+
     bot.reply_to(m, text if "BUY" in text or "SELL" in text else "No signals.", parse_mode='HTML')
+
+
+@bot.message_handler(commands=['ai'])
+def ai_cmd(m):
+    parts = (m.text or "").strip().split()
+    pair = parts[1].upper().strip() if len(parts) >= 2 else "BTCUSD"
+    if pair not in PAIRS:
+        bot.reply_to(m, f"Unknown pair: {pair}")
+        return
+
+    sig, reasons, ind15, ind1h = get_intraday_signal(pair, PAIRS[pair], enforce_hours=False)
+    if ind15 is None:
+        bot.reply_to(m, "No data")
+        return
+
+    sig_txt = "NO SIGNAL" if sig == 0 else ("BUY" if sig == 1 else "SELL")
+    lines = [f"<b>AI</b> {pair} TF:15m • {sig_txt}"]
+
+    for r in (reasons or []):
+        if not isinstance(r, str):
+            continue
+        if r.startswith("VitalityScore:") or r.startswith("GoyaScore:") or r.startswith("DeepSeekScore:") or r.startswith("DXY("):
+            lines.append(r)
+        if r.startswith("DeepSeek:") or r.startswith("DXY confirm:"):
+            lines.append(r)
+
+    bot.reply_to(m, "\n".join(lines), parse_mode='HTML')
+
+
+@bot.message_handler(commands=['backtest'])
+def backtest_cmd(m):
+    parts = (m.text or "").strip().split()
+    pair = parts[1].upper().strip() if len(parts) >= 2 else "EURUSD"
+    tf = parts[2].lower().strip() if len(parts) >= 3 else "1h"
+
+    if pair not in PAIRS:
+        bot.reply_to(m, f"Unknown pair: {pair}")
+        return
+
+    if pair in CRYPTO_PAIRS and tf not in ["15m", "1h"]:
+        bot.reply_to(m, "Для крипты бэктест доступен только на 15m/1h")
+        return
+
+    try:
+        df, tf_norm = get_history(pair, tf=tf)
+    except Exception as e:
+        bot.reply_to(m, f"History error: {e}")
+        return
+
+    if df is None or df.empty:
+        bot.reply_to(m, "No history")
+        return
+
+    with config_lock:
+        sl = float(CONFIG.get("sl_atr_multiplier", 2.0))
+        tp = float(CONFIG.get("tp_atr_multiplier", 6.0))
+        tr_on = bool(CONFIG.get("trailing_stop", True))
+        tr = float(CONFIG.get("trailing_stop_atr_multiplier", 1.5)) if tr_on else None
+        fee = float(CONFIG.get("backtest_commission_bps", 0.0) or 0.0)
+
+    bt = backtest_macd_rsi(df, rsi_min=50.0, macd_fast=12, macd_slow=26, macd_signal=9, sl_atr_mult=sl, tp_atr_mult=tp, trailing_atr_mult=tr, commission_bps=fee)
+    mt = backtest_metrics(bt)
+    if not mt.get("ok"):
+        bot.reply_to(m, f"Backtest error: {mt.get('error')}")
+        return
+
+    bot.reply_to(
+        m,
+        f"<b>Backtest</b> {pair} TF:{tf}\n"
+        f"Return: {mt['total_return_pct']:+.2f}%\n"
+        f"MaxDD: {mt['max_dd_pct']:.2f}%\n"
+        f"Trades: {mt['trades']} | WR: {mt['win_rate_pct']:.1f}%\n"
+        f"PF: {mt['profit_factor']:.2f}\n"
+        f"Sharpe: {mt['sharpe']:.2f} | Sortino: {mt['sortino']:.2f}",
+        parse_mode='HTML',
+    )
 
 @bot.message_handler(commands=['trade'])
 def trade(m):
@@ -2695,7 +3340,7 @@ def auto_trade():
                 RUNTIME["auto_trade_last_open_pair"] = pair
                 direction = "LONG" if sig == 1 else "SHORT"
                 notify(
-                    f"AUTO [{direction}]\n\nTF: 15m (confirm 1h)\nPair: {pair}\nEntry: {fp(pair, ind15)}\nGoyaScore: {int(sc):+d}\n\n"
+                    f"AUTO [{direction}]\n\nTF: 15m (confirm 1h)\nPair: {pair}\nEntry: {fp(pair, ind15)}\nVitalityScore: {int(sc):+d}\n\n"
                     + "\n".join(f"- {s}" for s in sigs)
                 )
                 print(f"Auto: {pair} {direction}")
@@ -2720,7 +3365,7 @@ def auto_trade():
                 if sample is not None:
                     p, s, rs, sc = sample
                     dir_txt = "BUY" if s == 1 else "SELL" if s == -1 else "NO SIGNAL"
-                    RUNTIME["auto_trade_last_sample"] = f"{p} {dir_txt} GoyaScore={int(sc):+d}: " + ", ".join(rs)
+                    RUNTIME["auto_trade_last_sample"] = f"{p} {dir_txt} VitalityScore={int(sc):+d}: " + ", ".join(rs)
                 else:
                     RUNTIME["auto_trade_last_sample"] = None
 
@@ -2728,7 +3373,7 @@ def auto_trade():
                 if sample is not None:
                     p, s, rs, sc = sample
                     dir_txt = "BUY" if s == 1 else "SELL" if s == -1 else "NO SIGNAL"
-                    msg += f" sample={p} {dir_txt} GoyaScore={int(sc):+d}: " + ", ".join(rs)
+                    msg += f" sample={p} {dir_txt} VitalityScore={int(sc):+d}: " + ", ".join(rs)
                 print(msg, flush=True)
             except Exception:
                 pass

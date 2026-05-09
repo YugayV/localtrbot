@@ -11,6 +11,50 @@ import multi_pairs_bot as botmod
 
 st.set_page_config(page_title="LocalTRBot", layout="wide")
 
+st.markdown(
+    """
+<style>
+:root { --bg:#0b1220; --card:#0f1a2b; --muted:#9fb0c6; --text:#e8eef8; --line:#1e2a40; }
+.block-container { padding-top: 1.2rem; }
+[data-testid="stMetric"] { background: var(--card); border: 1px solid var(--line); padding: 12px 14px; border-radius: 14px; }
+.kpi-row { display:flex; gap:8px; flex-wrap:wrap; margin: 6px 0 2px 0; }
+.pill { display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius: 999px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); color: var(--text); font-size: 12.5px; }
+.dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+.dot-green{ background:#00D18F; }
+.dot-red{ background:#FF4D4D; }
+.dot-amber{ background:#FFB020; }
+.dot-blue{ background:#4DA3FF; }
+.dot-gray{ background:#7A8CA6; }
+.hdr { background: linear-gradient(90deg, rgba(77,163,255,0.16), rgba(0,209,143,0.10)); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 14px 16px; }
+.hdr h1 { margin:0; font-size: 22px; }
+.hdr p { margin: 4px 0 0 0; color: var(--muted); font-size: 13px; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+def _dot_class(kind: str) -> str:
+    k = (kind or "").lower().strip()
+    if k in ["green", "up", "buy", "on", "pos"]:
+        return "dot dot-green"
+    if k in ["red", "down", "sell", "off", "neg"]:
+        return "dot dot-red"
+    if k in ["amber", "warn"]:
+        return "dot dot-amber"
+    if k in ["blue", "info"]:
+        return "dot dot-blue"
+    return "dot dot-gray"
+
+
+def _pill(label: str, value: str, kind: str = "gray") -> str:
+    return f"<span class='pill'><span class='{_dot_class(kind)}'></span><span><b>{label}</b>: {value}</span></span>"
+
+
+def _render_pills(items):
+    html = "<div class='kpi-row'>" + "".join(items) + "</div>"
+    st.markdown(html, unsafe_allow_html=True)
+
 
 @st.cache_resource
 def _start_background():
@@ -98,16 +142,32 @@ def _fmt_ts(ts):
     except Exception:
         return str(ts)
 
-st.title("LocalTRBot — Streamlit Dashboard")
+cfg = botmod.get_public_config()
 
-if st.button("Refresh data", width="stretch"):
-    st.cache_data.clear()
-    st.rerun()
-
-st.caption(
-    "Dashboard mode: bot logic runs in separate worker process | "
-    f"last_open={_fmt_ts(rt.get('auto_trade_last_open_ts'))} {rt.get('auto_trade_last_open_pair') or ''}"
+st.markdown(
+    """
+<div class="hdr">
+  <h1>LocalTRBot — Dashboard</h1>
+  <p>Worker‑режим: торговля и Telegram работают отдельно • last_open: {last_open}</p>
+</div>
+""".format(
+        last_open=(
+            f"{_fmt_ts(rt.get('auto_trade_last_open_ts'))} {rt.get('auto_trade_last_open_pair') or ''}".strip()
+            or "—"
+        )
+    ),
+    unsafe_allow_html=True,
 )
+
+c_hdr1, c_hdr2, c_hdr3 = st.columns([1.2, 1.2, 1], gap="small")
+with c_hdr1:
+    if st.button("Обновить данные", width="stretch"):
+        st.cache_data.clear()
+        st.rerun()
+with c_hdr2:
+    st.caption(f"Последний скан: candidates={rt.get('auto_trade_last_candidates') if isinstance(rt, dict) else '—'}")
+with c_hdr3:
+    st.caption(f"Sample: {rt.get('auto_trade_last_sample') if isinstance(rt, dict) else '—'}")
 
 if rt.get("auto_trade_last_error"):
     st.error(f"Auto-trade error: {rt['auto_trade_last_error']}")
@@ -161,36 +221,47 @@ with col_right:
         st.success(f"Closed: {len(closed)}")
         st.rerun()
 
-    st.subheader("Settings")
-    trades_per_pair = st.number_input("Trades per pair", min_value=0, max_value=20, value=int(cfg["trades_per_pair"]), step=1)
-    max_total_positions = st.number_input("Max total positions", min_value=0, max_value=50, value=int(cfg.get("max_total_positions", 10)), step=1)
-    sl_atr_multiplier = st.number_input("Stop loss (ATR x)", min_value=0.1, max_value=20.0, value=float(cfg.get("sl_atr_multiplier", 2.0)), step=0.1)
-    tp_atr_multiplier = st.number_input("Take profit (ATR x)", min_value=0.1, max_value=50.0, value=float(cfg.get("tp_atr_multiplier", 6.0)), step=0.1)
-    leverage = st.number_input("Leverage", min_value=0.1, max_value=1000.0, value=float(cfg["leverage"]), step=1.0)
-    check_interval = st.number_input("Check interval (sec)", min_value=5, value=int(cfg["check_interval"]), step=5)
+    with st.expander("Настройки", expanded=True):
+        cset1, cset2 = st.columns(2)
+        with cset1:
+            trades_per_pair = st.number_input("Trades per pair", min_value=0, max_value=20, value=int(cfg["trades_per_pair"]), step=1)
+            max_total_positions = st.number_input("Max total positions", min_value=0, max_value=50, value=int(cfg.get("max_total_positions", 10)), step=1)
+            goya_score_enabled = st.selectbox("VitalityScore", ["true", "false"], index=0 if bool(cfg.get("goya_score_enabled", True)) else 1)
+            goya_min_score = st.number_input("Vitality min score", min_value=0, max_value=100, value=int(cfg.get("goya_min_score", 35)), step=1)
+            deepseek_enabled = st.selectbox("DeepSeek (AI фильтр)", ["false", "true"], index=1 if bool(cfg.get("deepseek_enabled", False)) else 0)
+            show_ai_indicators = st.selectbox("Показывать AI индикаторы", ["false", "true"], index=1 if bool(st.session_state.get("show_ai_indicators", False)) else 0)
+            st.session_state["show_ai_indicators"] = (show_ai_indicators == "true")
+        with cset2:
+            sl_atr_multiplier = st.number_input("SL (ATR x)", min_value=0.1, max_value=20.0, value=float(cfg.get("sl_atr_multiplier", 2.0)), step=0.1)
+            tp_atr_multiplier = st.number_input("TP (ATR x)", min_value=0.1, max_value=50.0, value=float(cfg.get("tp_atr_multiplier", 6.0)), step=0.1)
+            leverage = st.number_input("Leverage", min_value=0.1, max_value=1000.0, value=float(cfg["leverage"]), step=1.0)
+            check_interval = st.number_input("Check interval (sec)", min_value=5, value=int(cfg["check_interval"]), step=5)
+            backtest_commission_bps = st.number_input("Backtest fee (bps)", min_value=0.0, max_value=200.0, value=float(cfg.get("backtest_commission_bps", 0.0) or 0.0), step=0.1)
 
-    goya_score_enabled = st.selectbox("GoyaScore enabled", ["true", "false"], index=0 if bool(cfg.get("goya_score_enabled", True)) else 1)
-    goya_min_score = st.number_input("Goya min score (0..100)", min_value=0, max_value=100, value=int(cfg.get("goya_min_score", 35)), step=1)
-
-    if st.button("Save settings", width="stretch"):
-        botmod.apply_config_patch(
-            {
-                "trades_per_pair": trades_per_pair,
-                "max_total_positions": max_total_positions,
-                "sl_atr_multiplier": sl_atr_multiplier,
-                "tp_atr_multiplier": tp_atr_multiplier,
-                "leverage": leverage,
-                "check_interval": check_interval,
-                "goya_score_enabled": goya_score_enabled,
-                "goya_min_score": goya_min_score,
-            }
-        )
-        st.success("Saved")
+        if st.button("Сохранить", width="stretch"):
+            botmod.apply_config_patch(
+                {
+                    "trades_per_pair": trades_per_pair,
+                    "max_total_positions": max_total_positions,
+                    "sl_atr_multiplier": sl_atr_multiplier,
+                    "tp_atr_multiplier": tp_atr_multiplier,
+                    "leverage": leverage,
+                    "check_interval": check_interval,
+                    "backtest_commission_bps": backtest_commission_bps,
+                    "goya_score_enabled": goya_score_enabled,
+                    "goya_min_score": goya_min_score,
+                    "deepseek_enabled": deepseek_enabled,
+                }
+            )
+            st.success("Сохранено")
 
 with col_left:
     pairs = list(botmod.PAIRS.keys())
-    pair = st.selectbox("Pair", pairs, index=0)
-    tf = st.selectbox("TF", ["15m", "1h"], index=0)
+    sel1, sel2 = st.columns([1.3, 0.7], gap="small")
+    with sel1:
+        pair = st.selectbox("Пара", pairs, index=0)
+    with sel2:
+        tf = st.selectbox("Таймфрейм", ["15m", "1h"], index=0)
 
     try:
         with st.spinner("Loading market data..."):
@@ -206,16 +277,58 @@ with col_left:
     elif sig == -1:
         sig_txt = "SELL"
 
-    st.markdown(f"**{pair} • TF {tf_norm} • {sig_txt}**")
+    price = float((ind or {}).get("price") or 0.0) if isinstance(ind, dict) else 0.0
+    change = float((ind or {}).get("change") or 0.0) if isinstance(ind, dict) else 0.0
+    rsi = float((ind or {}).get("rsi") or 0.0) if isinstance(ind, dict) else 0.0
+    trend = int((ind or {}).get("trend") or 0) if isinstance(ind, dict) else 0
+    vitality_sc = None
+    try:
+        vitality_sc = int((ind or {}).get("goya_score"))
+    except Exception:
+        vitality_sc = None
 
-    goya_line = None
-    if reasons:
+    m1, m2, m3, m4 = st.columns([1.1, 1.1, 1.1, 1.1], gap="small")
+    with m1:
+        st.metric("Цена", f"{price:.5f}" if pair not in (getattr(botmod, "CRYPTO_PAIRS", set()) or set()) else f"{price:.2f}")
+    with m2:
+        st.metric("Изменение", f"{change:+.2f}%")
+    with m3:
+        st.metric("RSI", f"{rsi:.0f}")
+    with m4:
+        st.metric("VitalityScore", (f"{int(vitality_sc):+d}" if isinstance(vitality_sc, int) else "—"))
+
+    st.markdown(f"**{pair} • {tf_norm} • {sig_txt}**")
+
+    pills = []
+    pills.append(_pill("Сигнал", sig_txt, "green" if sig == 1 else "red" if sig == -1 else "gray"))
+    pills.append(_pill("Тренд", "UP" if trend == 1 else "DOWN" if trend == -1 else "—", "green" if trend == 1 else "red" if trend == -1 else "gray"))
+    if isinstance(vitality_sc, int):
+        pills.append(_pill("Vitality", f"{int(vitality_sc):+d}", "green" if vitality_sc > 0 else "red" if vitality_sc < 0 else "gray"))
+    pills.append(_pill("Trading", "ON" if bool((cfg or {}).get("auto_trade_enabled", True)) else "OFF", "green" if bool((cfg or {}).get("auto_trade_enabled", True)) else "red"))
+    if rt.get("auto_trade_last_candidates") is not None:
+        pills.append(_pill("Candidates", str(rt.get("auto_trade_last_candidates")), "blue"))
+    _render_pills(pills)
+
+    if bool(st.session_state.get("show_ai_indicators", False)):
+        ind_atr = float((ind or {}).get("atr") or 0.0) if isinstance(ind, dict) else 0.0
+        ds_line = None
+        model_line = None
         try:
-            goya_line = next((r for r in reasons if isinstance(r, str) and r.startswith("GoyaScore:")), None)
+            ds_line = next((r for r in (reasons or []) if isinstance(r, str) and r.startswith("DeepSeekScore:")), None)
         except Exception:
-            goya_line = None
-    if goya_line:
-        st.caption(goya_line)
+            ds_line = None
+        try:
+            model_line = next((r for r in (reasons or []) if isinstance(r, str) and r.startswith("Model p(up)=")), None)
+        except Exception:
+            model_line = None
+
+        extra = []
+        extra.append(_pill("ATR", f"{ind_atr:.5f}" if pair not in (getattr(botmod, "CRYPTO_PAIRS", set()) or set()) else f"{ind_atr:.2f}", "blue"))
+        if model_line:
+            extra.append(_pill("Model", model_line.replace("Model ", ""), "amber"))
+        if ds_line:
+            extra.append(_pill("DeepSeek", ds_line.replace("DeepSeekScore:", "").strip(), "amber"))
+        _render_pills(extra)
 
     if plan and plan.get("direction") in [1, -1]:
         rr = plan.get("rr")
@@ -224,8 +337,108 @@ with col_left:
     else:
         st.info("Plan: —")
 
+    with st.expander("Бэктест и оптимизация", expanded=False):
+        st.caption("Идея из статьи: быстро проверить стратегию на истории, затем перебрать варианты и сравнить метрики (Sortino/MaxDD/PF).")
+
+        strat = st.selectbox("Стратегия", ["MACD+RSI (моментум)", "Bollinger (mean-reversion)"], index=0)
+
+        fee_bps = float((cfg or {}).get("backtest_commission_bps", 0.0) or 0.0)
+        st.caption(f"Комиссия (bps): {fee_bps}")
+
+        sl = float((cfg or {}).get("sl_atr_multiplier", 2.0))
+        tp = float((cfg or {}).get("tp_atr_multiplier", 6.0))
+        tr_on = bool((cfg or {}).get("trailing_stop", True))
+        tr = float((cfg or {}).get("trailing_stop_atr_multiplier", 1.5)) if tr_on else None
+
+        if strat.startswith("MACD"):
+            bt_rsi_min = st.slider("RSI порог (вход)", min_value=40, max_value=60, value=50, step=1)
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                macd_fast = st.number_input("MACD fast", min_value=2, max_value=50, value=12, step=1)
+            with c2:
+                macd_slow = st.number_input("MACD slow", min_value=3, max_value=80, value=26, step=1)
+            with c3:
+                macd_sig = st.number_input("MACD signal", min_value=2, max_value=30, value=9, step=1)
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                bb_period = st.number_input("BB period", min_value=10, max_value=60, value=20, step=1)
+            with c2:
+                bb_mult = st.number_input("BB mult", min_value=0.8, max_value=4.0, value=2.0, step=0.1)
+            with c3:
+                rsi_low = st.number_input("RSI low", min_value=10.0, max_value=50.0, value=40.0, step=1.0)
+            with c4:
+                rsi_high = st.number_input("RSI high", min_value=50.0, max_value=90.0, value=60.0, step=1.0)
+
+        run_bt = st.button("Запустить бэктест", width="stretch")
+        run_opt = st.button("Оптимизировать (топ-5)", width="stretch")
+
+        if run_bt:
+            try:
+                if strat.startswith("MACD"):
+                    bt = botmod.backtest_macd_rsi(
+                        df,
+                        rsi_min=float(bt_rsi_min),
+                        macd_fast=int(macd_fast),
+                        macd_slow=int(macd_slow),
+                        macd_signal=int(macd_sig),
+                        sl_atr_mult=sl,
+                        tp_atr_mult=tp,
+                        trailing_atr_mult=tr,
+                        commission_bps=float(fee_bps),
+                    )
+                else:
+                    bt = botmod.backtest_bbands_meanrev(
+                        df,
+                        bb_period=int(bb_period),
+                        bb_mult=float(bb_mult),
+                        rsi_low=float(rsi_low),
+                        rsi_high=float(rsi_high),
+                        sl_atr_mult=sl,
+                        tp_atr_mult=max(3.0, float(tp) * 0.7),
+                        trailing_atr_mult=tr,
+                        commission_bps=float(fee_bps),
+                    )
+
+                mt = botmod.backtest_metrics(bt)
+                if not mt.get("ok"):
+                    st.error(f"Backtest error: {mt.get('error')}")
+                else:
+                    st.dataframe(pd.DataFrame([mt]), width="stretch", hide_index=True)
+
+                    eq = pd.DataFrame(bt.get("equity") or [])
+                    if not eq.empty and "t" in eq.columns:
+                        eq["t"] = pd.to_datetime(eq["t"])
+                        fig2 = go.Figure()
+                        fig2.add_trace(go.Scatter(x=eq["t"], y=eq["equity"], mode="lines", name="Equity"))
+                        fig2.update_layout(template="plotly_dark", height=260, margin=dict(l=10, r=10, t=10, b=10))
+                        st.plotly_chart(fig2, width="stretch")
+
+                    trd = pd.DataFrame([t for t in (bt.get("trades") or []) if t.get("status") != "OPEN"])
+                    if not trd.empty:
+                        st.dataframe(trd.tail(50), width="stretch", hide_index=True)
+            except Exception as e:
+                st.error(f"Backtest error: {e}")
+
+        if run_opt:
+            try:
+                if strat.startswith("MACD"):
+                    top = botmod.optimize_macd_rsi(df, commission_bps=float(fee_bps), top_n=5)
+                else:
+                    top = botmod.optimize_bbands_meanrev(df, commission_bps=float(fee_bps), top_n=5)
+
+                if not top:
+                    st.warning("Нет результатов")
+                else:
+                    st.dataframe(pd.DataFrame(top), width="stretch", hide_index=True)
+            except Exception as e:
+                st.error(f"Optimize error: {e}")
+
     fig = go.Figure()
     if not df.empty:
+        up = df["Close"] >= df["Open"]
+        vol = df["Volume"] if "Volume" in df.columns else None
+
         fig.add_trace(
             go.Candlestick(
                 x=df.index,
@@ -233,12 +446,37 @@ with col_left:
                 high=df["High"],
                 low=df["Low"],
                 close=df["Close"],
-                name="Price",
+                name="Цена",
+                increasing_line_color="#00D18F",
+                decreasing_line_color="#FF4D4D",
+                increasing_fillcolor="rgba(0,209,143,0.35)",
+                decreasing_fillcolor="rgba(255,77,77,0.35)",
             )
         )
 
+        if vol is not None:
+            colors = ["rgba(0,209,143,0.35)" if bool(u) else "rgba(255,77,77,0.35)" for u in up.tolist()]
+            fig.add_trace(
+                go.Bar(
+                    x=df.index,
+                    y=vol,
+                    name="Объём",
+                    marker_color=colors,
+                    opacity=0.7,
+                    yaxis="y2",
+                )
+            )
 
-    fig.update_layout(height=650, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False)
+    fig.update_layout(
+        template="plotly_dark",
+        height=820,
+        margin=dict(l=10, r=10, t=28, b=10),
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.06)"),
+        xaxis=dict(showgrid=False),
+        yaxis2=dict(overlaying="y", side="right", showgrid=False, rangemode="tozero", title=""),
+    )
     st.plotly_chart(fig, width="stretch")
 
     c1, c2 = st.columns(2)
