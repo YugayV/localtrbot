@@ -300,6 +300,14 @@ with col_left:
         st.caption(f"Confirm(1h): RSI {float(confirm.get('rsi', 0) or 0):.1f} • Trend {confirm.get('trend')}")
 
     if reasons:
+        try:
+            dxy_line = next((r for r in reasons if isinstance(r, str) and r.startswith("DXY(")), None)
+        except Exception:
+            dxy_line = None
+        if dxy_line:
+            st.caption(dxy_line)
+
+    if reasons:
         with st.expander("Signal reasons"):
             st.write(reasons)
 

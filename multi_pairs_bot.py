@@ -171,6 +171,8 @@ PAIRS = {
     "EURGBP": "EURGBP=X",
 }
 
+DXY_TICKERS = ["DX-Y.NYB", "DX-Y", "DXY"]
+
 # Timezone for Korea (UTC+9)
 def get_seoul_time():
     return datetime.now(timezone(timedelta(hours=9)))
@@ -579,6 +581,65 @@ def get_indicators(data, pair_name):
         'pair': pair_name,
     }
 
+def _rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean().replace(0, 1e-9)
+    return 100 - (100 / (1 + (gain / loss)))
+
+
+def _dxy_confirmation_for_eurusd(ind15, interval="15m"):
+    dxy = get_data(DXY_TICKERS, period="5d" if interval in ["15m", "30m"] else "60d", interval=interval)
+    if dxy is None or dxy.empty or len(dxy) < 20:
+        dxy = get_data(DXY_TICKERS, period="60d", interval="1h")
+        interval = "1h"
+
+    if dxy is None or dxy.empty or len(dxy) < 20:
+        return None
+
+    close = dxy["Close"].astype(float)
+    dxy_px = float(close.iloc[-1])
+    dxy_ret = float(close.pct_change().iloc[-1])
+    dxy_mom3 = float(close.pct_change(3).iloc[-1]) if len(close) >= 4 else 0.0
+    dxy_rsi = float(_rsi_series(close, 14).iloc[-1])
+
+    eur_rsi = float(ind15.get("rsi") or 50)
+
+    score = 0
+    details = []
+
+    if dxy_ret < -0.001 and eur_rsi < 40:
+        score += 1
+        details.append("DXY DOWN + EUR RSI low")
+    if dxy_ret > 0.001 and eur_rsi > 60:
+        score -= 1
+        details.append("DXY UP + EUR RSI high")
+
+    if dxy_mom3 < -0.002:
+        score += 1
+        details.append("DXY momentum bearish")
+    if dxy_mom3 > 0.002:
+        score -= 1
+        details.append("DXY momentum bullish")
+
+    macro_dir = 0
+    if score >= 2:
+        macro_dir = 1
+    elif score <= -2:
+        macro_dir = -1
+
+    return {
+        "interval": interval,
+        "dxy": dxy_px,
+        "ret": dxy_ret,
+        "mom3": dxy_mom3,
+        "rsi": dxy_rsi,
+        "score": int(score),
+        "dir": int(macro_dir),
+        "details": details,
+    }
+
+
 def check_signal(ind, enforce_hours=True):
     signals = []
     rsi = ind['rsi']
@@ -668,6 +729,22 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
         reasons.append("Crypto mode: trend filters disabled")
 
     if pair not in CRYPTO_PAIRS:
+        if pair == "EURUSD":
+            try:
+                macro = _dxy_confirmation_for_eurusd(ind15, interval="15m")
+                if macro is not None:
+                    reasons.append(
+                        f"DXY({macro['interval']}): {macro['dxy']:.2f} ret={macro['ret']*100:+.2f}% mom3={macro['mom3']*100:+.2f}% rsi={macro['rsi']:.0f} score={macro['score']}"
+                    )
+                    for d in (macro.get("details") or [])[:4]:
+                        reasons.append(f"DXY confirm: {d}")
+
+                    if sig != 0 and int(macro.get("dir") or 0) != 0 and int(macro.get("dir") or 0) != int(sig):
+                        reasons.append("Filter: DXY disagrees")
+                        sig = 0
+            except Exception:
+                pass
+
         if sig15 == 1 and float(ind1h.get('rsi', 50) or 50) < 48:
             reasons.append("Filter: 1h RSI < 48")
             sig = 0
