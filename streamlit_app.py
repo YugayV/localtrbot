@@ -35,14 +35,10 @@ def _get_trades_df():
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def _get_pair_history(pair: str, tf: str, zz: float):
+def _get_pair_history(pair: str, tf: str):
     df, tf_norm = botmod.get_history(pair, tf=tf)
     df = df.tail(2000)
-    candles = botmod._df_to_candles(df)
-    swings = botmod._zigzag_swings(candles, botmod._history_threshold(pair, tf_norm) * float(zz))[-12:]
-    impulse = botmod._elliott_impulse_check(swings)
-    swings = botmod._apply_impulse_labels(swings, impulse)
-    return df, tf_norm, swings, impulse
+    return df, tf_norm
 
 
 @st.cache_data(ttl=10, show_spinner=False)
@@ -159,125 +155,45 @@ with col_right:
             st.success("Trading started")
         st.rerun()
 
-    cta1, cta2 = st.columns(2)
-    with cta1:
-        if st.button("Pause trading", width="stretch"):
-            botmod.set_auto_trade_enabled(False, reason="MANUAL PAUSE")
-            st.success("Trading paused")
-            st.rerun()
-    with cta2:
-        if st.button("Resume trading", width="stretch"):
-            botmod.set_auto_trade_enabled(True, reason=None)
-            st.success("Trading resumed")
-            st.rerun()
-
     if st.button("Close all open positions", width="stretch"):
         closed = botmod.close_all_positions(reason="MANUAL CLOSE")
         st.success(f"Closed: {len(closed)}")
         st.rerun()
 
-    st.subheader("Risk Management (ATR-based)")
-    c1, c2 = st.columns(2)
-    with c1:
-        risk_per_trade = st.number_input("Risk per trade (%)", min_value=0.1, max_value=100.0, value=float(cfg["risk_per_trade"]), step=0.1)
-        trades_per_pair = st.number_input("Trades per pair", min_value=0, max_value=20, value=int(cfg["trades_per_pair"]), step=1)
-        max_total_positions = st.number_input("Max total positions", min_value=0, max_value=50, value=int(cfg.get("max_total_positions", 10)), step=1)
-        sl_atr_multiplier = st.number_input("Stop loss (ATR x)", min_value=0.1, max_value=20.0, value=float(cfg.get("sl_atr_multiplier", 2.0)), step=0.1)
-        tp_atr_multiplier = st.number_input("Take profit (ATR x)", min_value=0.1, max_value=50.0, value=float(cfg.get("tp_atr_multiplier", 6.0)), step=0.1)
-    with c2:
-        trailing_stop = st.selectbox("Trailing stop", ["true", "false"], index=0 if bool(cfg.get("trailing_stop", True)) else 1)
-        trailing_stop_atr_multiplier = st.number_input("Trailing stop (ATR x)", min_value=0.1, max_value=20.0, value=float(cfg.get("trailing_stop_atr_multiplier", 1.5)), step=0.1)
-        leverage = st.number_input("Leverage", min_value=0.1, max_value=1000.0, value=float(cfg["leverage"]), step=1.0)
-        check_interval = st.number_input("Check interval (sec)", min_value=5, value=int(cfg["check_interval"]), step=5)
-        auto_trade_enabled = st.selectbox("Auto-trade enabled", ["true", "false"], index=0 if bool(cfg["auto_trade_enabled"]) else 1)
+    st.subheader("Settings")
+    trades_per_pair = st.number_input("Trades per pair", min_value=0, max_value=20, value=int(cfg["trades_per_pair"]), step=1)
+    max_total_positions = st.number_input("Max total positions", min_value=0, max_value=50, value=int(cfg.get("max_total_positions", 10)), step=1)
+    sl_atr_multiplier = st.number_input("Stop loss (ATR x)", min_value=0.1, max_value=20.0, value=float(cfg.get("sl_atr_multiplier", 2.0)), step=0.1)
+    tp_atr_multiplier = st.number_input("Take profit (ATR x)", min_value=0.1, max_value=50.0, value=float(cfg.get("tp_atr_multiplier", 6.0)), step=0.1)
+    leverage = st.number_input("Leverage", min_value=0.1, max_value=1000.0, value=float(cfg["leverage"]), step=1.0)
+    check_interval = st.number_input("Check interval (sec)", min_value=5, value=int(cfg["check_interval"]), step=5)
 
-    st.subheader("Daily Limits")
-    daily_profit_target_pct = st.number_input(
-        "Daily profit target (%)",
-        min_value=0.0,
-        max_value=100.0,
-        value=float(cfg.get("daily_profit_target_pct", 0.0) or 0.0),
-        step=0.1,
-    )
-    daily_loss_limit_pct = st.number_input(
-        "Daily loss limit (%)",
-        min_value=0.0,
-        max_value=100.0,
-        value=float(cfg.get("daily_loss_limit_pct", 0.0) or 0.0),
-        step=0.1,
-    )
-    close_positions_on_stop = st.selectbox(
-        "Close positions on stop",
-        ["false", "true"],
-        index=1 if bool(cfg.get("close_positions_on_stop", False)) else 0,
-    )
+    goya_score_enabled = st.selectbox("GoyaScore enabled", ["true", "false"], index=0 if bool(cfg.get("goya_score_enabled", True)) else 1)
+    goya_min_score = st.number_input("Goya min score (0..100)", min_value=0, max_value=100, value=int(cfg.get("goya_min_score", 35)), step=1)
 
     if st.button("Save settings", width="stretch"):
         botmod.apply_config_patch(
             {
-                "risk_per_trade": risk_per_trade,
                 "trades_per_pair": trades_per_pair,
                 "max_total_positions": max_total_positions,
                 "sl_atr_multiplier": sl_atr_multiplier,
                 "tp_atr_multiplier": tp_atr_multiplier,
-                "trailing_stop": trailing_stop,
-                "trailing_stop_atr_multiplier": trailing_stop_atr_multiplier,
                 "leverage": leverage,
                 "check_interval": check_interval,
-                "auto_trade_enabled": auto_trade_enabled,
-                "daily_profit_target_pct": daily_profit_target_pct,
-                "daily_loss_limit_pct": daily_loss_limit_pct,
-                "close_positions_on_stop": close_positions_on_stop,
+                "goya_score_enabled": goya_score_enabled,
+                "goya_min_score": goya_min_score,
             }
         )
         st.success("Saved")
-
-    with st.expander("Data & Model", expanded=False):
-        st.caption("Скачивает данные в ./data и сохраняет модель в ./models (в Railway хранилище может быть временным)")
-
-        pair_dm = st.selectbox("Pair", list(botmod.PAIRS.keys()), key="dm_pair")
-        is_crypto = pair_dm in (getattr(botmod, "CRYPTO_PAIRS", set()) or set())
-
-        tf_opts = ["15m", "1h"] if is_crypto else ["15m", "1h", "1d", "1wk"]
-        if "dm_tf" in st.session_state and st.session_state["dm_tf"] not in tf_opts:
-            st.session_state["dm_tf"] = tf_opts[0]
-        tf_dm = st.selectbox("TF", tf_opts, key="dm_tf")
-
-        force_dl = st.checkbox("Force re-download", value=False)
-
-        if st.button("Update data", width="stretch"):
-            try:
-                df_u = botmod.update_market_data(pair_dm, tf=tf_dm, bars=3000, force=force_dl, min_rows=240)
-                if df_u is None or df_u.empty:
-                    st.error("No data downloaded")
-                else:
-                    st.success(f"OK: {len(df_u)} rows")
-            except Exception as e:
-                st.error(f"Update error: {e}")
-
-        if st.button("Train 15m model", width="stretch"):
-            try:
-                m = botmod.train_direction_model(pair_dm, tf="15m", bars=5000)
-                acc = float((m.get("metrics") or {}).get("acc") or 0)
-                n = int((m.get("metrics") or {}).get("n") or 0)
-                st.success(f"Trained: acc={acc:.2f} n={n}")
-            except Exception as e:
-                st.error(f"Train error: {e}")
-
-    st.divider()
-    st.subheader("Account")
-    st.write(botmod.account.stats())
 
 with col_left:
     pairs = list(botmod.PAIRS.keys())
     pair = st.selectbox("Pair", pairs, index=0)
     tf = st.selectbox("TF", ["15m", "1h"], index=0)
-    zz = st.slider("ZigZag sensitivity (x)", min_value=0.5, max_value=3.0, value=1.0, step=0.1)
-    only_valid = st.checkbox("Only valid impulse", value=False)
 
     try:
         with st.spinner("Loading market data..."):
-            df, tf_norm, swings, impulse = _get_pair_history(pair, tf, zz)
+            df, tf_norm = _get_pair_history(pair, tf)
             sig, reasons, ind, confirm, plan = _intraday_signal_and_plan(pair, tf_norm)
     except Exception as e:
         st.error(f"Data load error: {e}")
@@ -289,27 +205,16 @@ with col_left:
     elif sig == -1:
         sig_txt = "SELL"
 
-    imp_txt = "Impulse: —"
-    if impulse:
-        imp_txt = "Impulse OK" if impulse.get("ok") else "Impulse INVALID: " + "; ".join(impulse.get("errors") or ["rules"])
-
     st.markdown(f"**{pair} • TF {tf_norm} • {sig_txt}**")
-    st.caption(imp_txt)
 
-    if confirm:
-        st.caption(f"Confirm(1h): RSI {float(confirm.get('rsi', 0) or 0):.1f} • Trend {confirm.get('trend')}")
-
+    goya_line = None
     if reasons:
         try:
-            dxy_line = next((r for r in reasons if isinstance(r, str) and r.startswith("DXY(")), None)
+            goya_line = next((r for r in reasons if isinstance(r, str) and r.startswith("GoyaScore:")), None)
         except Exception:
-            dxy_line = None
-        if dxy_line:
-            st.caption(dxy_line)
-
-    if reasons:
-        with st.expander("Signal reasons"):
-            st.write(reasons)
+            goya_line = None
+    if goya_line:
+        st.caption(goya_line)
 
     if plan and plan.get("direction") in [1, -1]:
         rr = plan.get("rr")
@@ -317,17 +222,6 @@ with col_left:
         st.info(f"Plan: {'LONG' if plan['direction']==1 else 'SHORT'} Entry {plan['entry']:.5f} • SL {plan['sl']:.5f} • TP {plan['tp']:.5f} • RR {rr_txt}")
     else:
         st.info("Plan: —")
-
-    fib_levels = []
-    try:
-        if hasattr(botmod, "get_fib_levels"):
-            fib_levels = botmod.get_fib_levels(swings, impulse)
-    except Exception:
-        fib_levels = []
-
-    if fib_levels:
-        with st.expander("Fibonacci", expanded=False):
-            st.dataframe(pd.DataFrame(fib_levels), width="stretch", hide_index=True)
 
     fig = go.Figure()
     if not df.empty:
@@ -342,28 +236,6 @@ with col_left:
             )
         )
 
-    if swings and not (only_valid and impulse and impulse.get("ok") is False):
-        xs = []
-        ys = []
-        texts = []
-        for p in swings:
-            t = pd.to_datetime(int(p["time"]), unit="s", utc=True).tz_convert(None)
-            xs.append(t)
-            ys.append(float(p["price"]))
-            texts.append(p.get("label") or "")
-
-        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers+text", text=texts, textposition="top center", name="Waves"))
-
-    if fib_levels and (df is not None) and (not df.empty):
-        x0 = df.index[0]
-        x1 = df.index[-1]
-        for lvl in fib_levels[:12]:
-            try:
-                yv = float(lvl.get("price"))
-            except Exception:
-                continue
-            fig.add_shape(type="line", x0=x0, x1=x1, y0=yv, y1=yv, line=dict(color="rgba(80,80,80,0.35)", width=1, dash="dot"))
-            fig.add_annotation(x=x1, y=yv, text=str(lvl.get("name")), showarrow=False, xanchor="left", font=dict(size=10, color="rgba(80,80,80,0.85)"))
 
     fig.update_layout(height=650, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, width="stretch")

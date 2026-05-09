@@ -52,6 +52,7 @@ _LOG_LOCK = threading.Lock()
 
 WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 
 if not BOT_TOKEN or not ADMIN_ID:
     raise RuntimeError("Missing BOT_TOKEN or ADMIN_ID in .env")
@@ -74,6 +75,15 @@ CONFIG_DEFAULTS = {
     "daily_profit_target_pct": 0.0,
     "daily_loss_limit_pct": 0.0,
     "close_positions_on_stop": False,
+    "goya_score_enabled": True,
+    "goya_min_score": 35,
+    "goya_rank_candidates": True,
+    "deepseek_enabled": False,
+    "deepseek_model": "deepseek-v4-flash",
+    "deepseek_timeout_sec": 10,
+    "deepseek_ttl_sec": 300,
+    "deepseek_min_local_score": 45,
+    "deepseek_min_confidence": 0.6,
 }
 
 
@@ -640,6 +650,173 @@ def _dxy_confirmation_for_eurusd(ind15, interval="15m"):
     }
 
 
+def _clip(x, lo, hi):
+    try:
+        return max(float(lo), min(float(x), float(hi)))
+    except Exception:
+        return float(lo)
+
+
+def _goya_score_local(pair, df15, ind15, ind1h, p_up=None):
+    rsi15 = float(ind15.get("rsi") or 50.0)
+    trend15 = int(ind15.get("trend") or 0)
+    change = float(ind15.get("change") or 0.0)
+
+    vol20 = None
+    try:
+        close = df15["Close"].astype(float)
+        vol20 = float(close.pct_change().rolling(20).std().iloc[-1])
+    except Exception:
+        vol20 = None
+
+    vol_scale = 1.0
+    if vol20 is not None and vol20 >= 0:
+        vol_scale = 1.0 / (1.0 + (vol20 * 40.0))
+
+    c_rsi = _clip((rsi15 - 50.0) / 25.0, -1.0, 1.0)
+    c_trend15 = 1.0 if trend15 == 1 else (-1.0 if trend15 == -1 else 0.0)
+    c_mom = float(np.tanh(change / 0.03))
+
+    c_trend1h = 0.0
+    if ind1h is not None:
+        t1h = int(ind1h.get("trend") or 0)
+        c_trend1h = 1.0 if t1h == 1 else (-1.0 if t1h == -1 else 0.0)
+
+    c_model = 0.0
+    has_model = False
+    if p_up is not None:
+        try:
+            c_model = _clip((float(p_up) - 0.5) * 2.0, -1.0, 1.0)
+            has_model = True
+        except Exception:
+            c_model = 0.0
+            has_model = False
+
+    parts = []
+    w_sum = 0.0
+    s_sum = 0.0
+
+    def add(name, w, val):
+        nonlocal w_sum, s_sum
+        w = float(w)
+        val = float(val)
+        parts.append({"name": name, "w": w, "v": val})
+        w_sum += abs(w)
+        s_sum += w * val
+
+    add("mom", 1.0, c_mom)
+    add("rsi", 1.0, c_rsi)
+    add("trend15", 1.0, c_trend15)
+    add("trend1h", 0.6, c_trend1h)
+    if has_model:
+        add("model", 1.2, c_model)
+
+    raw = (s_sum / w_sum) if w_sum else 0.0
+    score = int(round(_clip(raw * 100.0 * vol_scale, -100.0, 100.0)))
+
+    return {
+        "pair": pair,
+        "score": score,
+        "vol20": float(vol20) if vol20 is not None else None,
+        "parts": parts,
+    }
+
+
+_DEEPSEEK_LOCK = threading.Lock()
+_DEEPSEEK_CACHE = {}
+
+
+def _deepseek_goya_score(pair, tf_norm, ind15, ind1h, local_score):
+    with config_lock:
+        enabled = bool(CONFIG.get("deepseek_enabled", False))
+        model = str(CONFIG.get("deepseek_model", "deepseek-v4-flash") or "deepseek-v4-flash")
+        timeout = float(CONFIG.get("deepseek_timeout_sec", 10) or 10)
+        ttl = int(CONFIG.get("deepseek_ttl_sec", 300) or 300)
+        min_local = int(CONFIG.get("deepseek_min_local_score", 45) or 45)
+
+    if not enabled:
+        return None
+    if not DEEPSEEK_API_KEY:
+        return None
+    if abs(int(local_score)) < int(min_local):
+        return None
+
+    now = time.time()
+    cache_key = f"{pair}|{tf_norm}"
+    with _DEEPSEEK_LOCK:
+        hit = _DEEPSEEK_CACHE.get(cache_key)
+        if hit and (now - float(hit.get("ts") or 0)) < ttl:
+            return hit.get("data")
+
+    payload = {
+        "model": model,
+        "thinking": {"type": "disabled"},
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
+        "max_tokens": 220,
+        "stream": False,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Верни ТОЛЬКО JSON. Схема: {\"score\":-100..100,\"dir\":-1|0|1,\"confidence\":0..1,\"reasons\":[строки]}.",
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "pair": pair,
+                        "tf": tf_norm,
+                        "local_score": int(local_score),
+                        "rsi15": float(ind15.get("rsi") or 0.0),
+                        "trend15": int(ind15.get("trend") or 0),
+                        "change": float(ind15.get("change") or 0.0),
+                        "atr": float(ind15.get("atr") or 0.0),
+                        "rsi1h": float(ind1h.get("rsi") or 0.0) if ind1h else None,
+                        "trend1h": int(ind1h.get("trend") or 0) if ind1h else None,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+    }
+
+    try:
+        req = urllib.request.Request(
+            "https://api.deepseek.com/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", errors="ignore")
+        resp = json.loads(raw)
+        txt = (((resp.get("choices") or [{}])[0]).get("message") or {}).get("content")
+        data = json.loads(txt) if isinstance(txt, str) else None
+        if not isinstance(data, dict):
+            return None
+
+        score = int(float(data.get("score") or 0))
+        score = int(_clip(score, -100, 100))
+        d = int(float(data.get("dir") or 0))
+        if d not in (-1, 0, 1):
+            d = 0
+        conf = float(data.get("confidence") or 0.0)
+        conf = float(_clip(conf, 0.0, 1.0))
+        reasons = data.get("reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+
+        out = {"score": score, "dir": d, "confidence": conf, "reasons": [str(x) for x in reasons][:6]}
+        with _DEEPSEEK_LOCK:
+            _DEEPSEEK_CACHE[cache_key] = {"ts": now, "data": out}
+        return out
+    except Exception:
+        return None
+
+
 def check_signal(ind, enforce_hours=True):
     signals = []
     rsi = ind['rsi']
@@ -772,6 +949,7 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
     else:
         reasons.append("Crypto mode: relaxed filters (no 1h RSI / no breakout)")
 
+    p_up = None
     try:
         model = load_direction_model(pair, tf="15m")
         if model is not None:
@@ -783,6 +961,48 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
                     sig = 0
                 if sig == -1 and p_up > 0.48:
                     reasons.append("Filter: model p(up) > 0.48")
+                    sig = 0
+    except Exception:
+        pass
+
+    try:
+        gs = _goya_score_local(pair, d15, ind15, ind1h, p_up=p_up)
+        sc = int(gs.get("score") or 0) if gs else 0
+        ind15["goya_score"] = sc
+        v20 = gs.get("vol20") if gs else None
+        if v20 is not None:
+            reasons.append(f"GoyaScore: {sc:+d} vol20={float(v20)*100:.2f}%")
+        else:
+            reasons.append(f"GoyaScore: {sc:+d}")
+
+        with config_lock:
+            goya_on = bool(CONFIG.get("goya_score_enabled", True))
+            min_sc = int(CONFIG.get("goya_min_score", 35) or 0)
+
+        if goya_on and (pair in CRYPTO_PAIRS or pair == "EURUSD"):
+            if abs(sc) < int(min_sc):
+                if sig != 0:
+                    reasons.append(f"Filter: goya_score abs<{int(min_sc)}")
+                sig = 0
+            else:
+                dir_sc = 1 if sc > 0 else -1
+                if sig != 0 and dir_sc != int(sig):
+                    reasons.append("Filter: goya_score disagrees")
+                    sig = 0
+
+        ds = _deepseek_goya_score(pair, "15m", ind15, ind1h, local_score=sc)
+        if ds is not None:
+            reasons.append(f"DeepSeekScore: {int(ds.get('score') or 0):+d} conf={float(ds.get('confidence') or 0):.2f}")
+            for r in (ds.get("reasons") or [])[:4]:
+                reasons.append(f"DeepSeek: {r}")
+
+            with config_lock:
+                min_conf = float(CONFIG.get("deepseek_min_confidence", 0.6) or 0.6)
+
+            if sig != 0 and float(ds.get("confidence") or 0) >= float(min_conf):
+                ddir = int(ds.get("dir") or 0)
+                if ddir != 0 and ddir != int(sig):
+                    reasons.append("Filter: deepseek disagrees")
                     sig = 0
     except Exception:
         pass
@@ -2429,6 +2649,8 @@ def auto_trade():
             open_total = len([p for p in account.positions if p.get("status") == "OPEN"])
             max_total = int(CONFIG.get("max_total_positions", 10))
 
+            scored = []
+
             for pair, ticker in PAIRS.items():
                 if len([p for p in account.positions if p['pair'] == pair]) >= trades_per_pair:
                     continue
@@ -2438,14 +2660,34 @@ def auto_trade():
                     continue
 
                 sig, sigs, ind15, ind1h = get_intraday_signal(pair, ticker, enforce_hours=False)
+                sc = 0
+                if ind15 is not None:
+                    try:
+                        sc = int(ind15.get("goya_score") or 0)
+                    except Exception:
+                        sc = 0
+
                 if ind15 is not None and sample is None:
-                    sample = (pair, sig, list(sigs)[:6])
+                    sample = (pair, sig, list(sigs)[:6], sc)
 
                 if sig != 0 and ind15 is not None:
                     candidates += 1
+                    scored.append((abs(sc), sc, pair, sig, sigs, ind15))
 
-                if sig == 0 or ind15 is None:
+            with config_lock:
+                rank_on = bool(CONFIG.get("goya_rank_candidates", True))
+
+            if rank_on:
+                scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+            slots = max(0, int(max_total) - int(open_total))
+            for _, sc, pair, sig, sigs, ind15 in scored[:slots]:
+                if len([p for p in account.positions if p['pair'] == pair]) >= trades_per_pair:
                     continue
+                if not enabled:
+                    break
+                if len([p for p in account.positions if p.get("status") == "OPEN"]) >= max_total:
+                    break
 
                 pos = account.open_trade(sig, ind15)
                 account.save_state()
@@ -2453,7 +2695,7 @@ def auto_trade():
                 RUNTIME["auto_trade_last_open_pair"] = pair
                 direction = "LONG" if sig == 1 else "SHORT"
                 notify(
-                    f"AUTO [{direction}]\n\nTF: 15m (confirm 1h)\nPair: {pair}\nEntry: {fp(pair, ind15)}\n\n"
+                    f"AUTO [{direction}]\n\nTF: 15m (confirm 1h)\nPair: {pair}\nEntry: {fp(pair, ind15)}\nGoyaScore: {int(sc):+d}\n\n"
                     + "\n".join(f"- {s}" for s in sigs)
                 )
                 print(f"Auto: {pair} {direction}")
@@ -2476,17 +2718,17 @@ def auto_trade():
 
                 RUNTIME["auto_trade_last_candidates"] = int(candidates)
                 if sample is not None:
-                    p, s, rs = sample
+                    p, s, rs, sc = sample
                     dir_txt = "BUY" if s == 1 else "SELL" if s == -1 else "NO SIGNAL"
-                    RUNTIME["auto_trade_last_sample"] = f"{p} {dir_txt}: " + ", ".join(rs)
+                    RUNTIME["auto_trade_last_sample"] = f"{p} {dir_txt} GoyaScore={int(sc):+d}: " + ", ".join(rs)
                 else:
                     RUNTIME["auto_trade_last_sample"] = None
 
                 msg = f"[AUTO] enabled={enabled} open={open_cnt} candidates={candidates}"
                 if sample is not None:
-                    p, s, rs = sample
+                    p, s, rs, sc = sample
                     dir_txt = "BUY" if s == 1 else "SELL" if s == -1 else "NO SIGNAL"
-                    msg += f" sample={p} {dir_txt}: " + ", ".join(rs)
+                    msg += f" sample={p} {dir_txt} GoyaScore={int(sc):+d}: " + ", ".join(rs)
                 print(msg, flush=True)
             except Exception:
                 pass
