@@ -88,6 +88,7 @@ def _intraday_signal_and_plan(pair: str, tf_norm: str):
 
 
 bg = _start_background()
+rt = getattr(botmod, "RUNTIME", {}) or {}
 
 def _fmt_ts(ts):
     if not ts:
