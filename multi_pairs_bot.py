@@ -1335,6 +1335,171 @@ def optimize_bbands_meanrev(df: pd.DataFrame, commission_bps: float = 0.0, top_n
     return out[: int(top_n)]
 
 
+def variant_report(bt: dict, params: dict | None = None, strategy: str | None = None):
+    mt = backtest_metrics(bt or {})
+    trades = list(bt.get("trades") or []) if isinstance(bt, dict) else []
+    closed = [t for t in trades if t.get("status") in ["WIN", "LOSS", "FLAT"]]
+
+    wins = sorted([t for t in closed if float(t.get("pnl") or 0.0) > 0], key=lambda x: float(x.get("pnl") or 0.0), reverse=True)
+    losses = sorted([t for t in closed if float(t.get("pnl") or 0.0) < 0], key=lambda x: float(x.get("pnl") or 0.0))
+
+    def _pick(rows, n=5):
+        out = []
+        for r in rows[: int(n)]:
+            out.append(
+                {
+                    "open_t": str(r.get("open_t")),
+                    "close_t": str(r.get("close_t")),
+                    "direction": int(r.get("direction") or 0),
+                    "entry": float(r.get("entry") or 0.0),
+                    "exit": float(r.get("exit") or 0.0) if r.get("exit") is not None else None,
+                    "pnl": float(r.get("pnl") or 0.0),
+                    "exit_reason": r.get("exit_reason"),
+                }
+            )
+        return out
+
+    exit_reasons = {}
+    for t in closed:
+        k = str(t.get("exit_reason") or "?")
+        exit_reasons[k] = int(exit_reasons.get(k, 0)) + 1
+
+    avg_pnl = float(np.mean([float(t.get("pnl") or 0.0) for t in closed])) if closed else 0.0
+
+    return {
+        "strategy": strategy or (params or {}).get("strategy"),
+        "params": params or {},
+        "metrics": mt,
+        "summary": {
+            "trades": int(len(closed)),
+            "wins": int(len([t for t in closed if t.get("status") == "WIN"])),
+            "losses": int(len([t for t in closed if t.get("status") == "LOSS"])),
+            "avg_pnl": avg_pnl,
+        },
+        "exit_reasons": exit_reasons,
+        "top_wins": _pick(wins, 5),
+        "top_losses": _pick(losses, 5),
+    }
+
+
+def _wf_slices(n: int, train_bars: int, test_bars: int, step_bars: int):
+    train_bars = int(train_bars)
+    test_bars = int(test_bars)
+    step_bars = int(step_bars)
+    if train_bars <= 0 or test_bars <= 0 or step_bars <= 0:
+        return []
+
+    out = []
+    start = 0
+    while True:
+        train_end = start + train_bars
+        test_end = train_end + test_bars
+        if test_end > n:
+            break
+        out.append((start, train_end, train_end, test_end))
+        start += step_bars
+    return out
+
+
+def walk_forward_optimize_macd_rsi(df: pd.DataFrame, commission_bps: float = 0.0, train_bars: int = 400, test_bars: int = 120, step_bars: int = 120):
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if df.empty:
+        return []
+
+    slices = _wf_slices(len(df), int(train_bars), int(test_bars), int(step_bars))
+    rows = []
+
+    for tr0, tr1, te0, te1 in slices:
+        d_train = df.iloc[tr0:tr1]
+        d_test = df.iloc[te0:te1]
+
+        best = (optimize_macd_rsi(d_train, commission_bps=float(commission_bps), top_n=1) or [None])[0]
+        if not best:
+            continue
+
+        train_metrics = {k: best.get(k) for k in ["total_return_pct", "max_dd_pct", "trades", "win_rate_pct", "profit_factor", "sharpe", "sortino"]}
+
+        macd_fast, macd_slow, macd_sig = [int(x) for x in str(best.get("macd") or "12,26,9").split(",")[:3]]
+        bt = backtest_macd_rsi(
+            d_test,
+            rsi_min=float(best.get("rsi_min") or 50),
+            macd_fast=macd_fast,
+            macd_slow=macd_slow,
+            macd_signal=macd_sig,
+            sl_atr_mult=float(best.get("sl_atr") or 2.0),
+            tp_atr_mult=float(best.get("tp_atr") or 6.0),
+            trailing_atr_mult=(float(best.get("trail_atr")) if best.get("trail_atr") is not None else None),
+            commission_bps=float(commission_bps),
+        )
+        oos = backtest_metrics(bt)
+        if not oos.get("ok"):
+            continue
+
+        rows.append(
+            {
+                "strategy": "MACD_RSI",
+                "train_start": str(d_train.index[0]),
+                "train_end": str(d_train.index[-1]),
+                "test_start": str(d_test.index[0]),
+                "test_end": str(d_test.index[-1]),
+                "params": {k: best.get(k) for k in ["rsi_min", "macd", "sl_atr", "tp_atr", "trail_atr"]},
+                "train": train_metrics,
+                "oos": {k: oos.get(k) for k in ["total_return_pct", "max_dd_pct", "trades", "win_rate_pct", "profit_factor", "sharpe", "sortino"]},
+            }
+        )
+
+    return rows
+
+
+def walk_forward_optimize_bbands_meanrev(df: pd.DataFrame, commission_bps: float = 0.0, train_bars: int = 400, test_bars: int = 120, step_bars: int = 120):
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if df.empty:
+        return []
+
+    slices = _wf_slices(len(df), int(train_bars), int(test_bars), int(step_bars))
+    rows = []
+
+    for tr0, tr1, te0, te1 in slices:
+        d_train = df.iloc[tr0:tr1]
+        d_test = df.iloc[te0:te1]
+
+        best = (optimize_bbands_meanrev(d_train, commission_bps=float(commission_bps), top_n=1) or [None])[0]
+        if not best:
+            continue
+
+        train_metrics = {k: best.get(k) for k in ["total_return_pct", "max_dd_pct", "trades", "win_rate_pct", "profit_factor", "sharpe", "sortino"]}
+
+        bt = backtest_bbands_meanrev(
+            d_test,
+            bb_period=int(best.get("bb_period") or 20),
+            bb_mult=float(best.get("bb_mult") or 2.0),
+            rsi_low=float(best.get("rsi_low") or 40),
+            rsi_high=float(best.get("rsi_high") or 60),
+            sl_atr_mult=float(best.get("sl_atr") or 2.0),
+            tp_atr_mult=float(best.get("tp_atr") or 4.0),
+            trailing_atr_mult=(float(best.get("trail_atr")) if best.get("trail_atr") is not None else None),
+            commission_bps=float(commission_bps),
+        )
+        oos = backtest_metrics(bt)
+        if not oos.get("ok"):
+            continue
+
+        rows.append(
+            {
+                "strategy": "BB_MEANREV",
+                "train_start": str(d_train.index[0]),
+                "train_end": str(d_train.index[-1]),
+                "test_start": str(d_test.index[0]),
+                "test_end": str(d_test.index[-1]),
+                "params": {k: best.get(k) for k in ["bb_period", "bb_mult", "rsi_low", "rsi_high", "sl_atr", "tp_atr", "trail_atr"]},
+                "train": train_metrics,
+                "oos": {k: oos.get(k) for k in ["total_return_pct", "max_dd_pct", "trades", "win_rate_pct", "profit_factor", "sharpe", "sortino"]},
+            }
+        )
+
+    return rows
+
+
 
 def check_signal(ind, enforce_hours=True):
     signals = []

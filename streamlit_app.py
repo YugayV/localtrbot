@@ -370,8 +370,26 @@ with col_left:
             with c4:
                 rsi_high = st.number_input("RSI high", min_value=50.0, max_value=90.0, value=60.0, step=1.0)
 
-        run_bt = st.button("Запустить бэктест", width="stretch")
-        run_opt = st.button("Оптимизировать (топ-5)", width="stretch")
+        mode = st.selectbox("Режим", ["Быстрый бэктест", "Walk-forward (anti overfit)"], index=0)
+        wf_train = 400
+        wf_test = 120
+        wf_step = 120
+        if mode.startswith("Walk"):
+            c_wf1, c_wf2, c_wf3 = st.columns(3)
+            with c_wf1:
+                wf_train = st.number_input("Train bars", min_value=100, max_value=3000, value=400, step=50)
+            with c_wf2:
+                wf_test = st.number_input("Test bars", min_value=50, max_value=2000, value=120, step=25)
+            with c_wf3:
+                wf_step = st.number_input("Step bars", min_value=25, max_value=2000, value=120, step=25)
+
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            run_bt = st.button("Запустить бэктест", width="stretch")
+        with b2:
+            run_opt = st.button("Оптимизировать (топ-5)", width="stretch")
+        with b3:
+            run_wf = st.button("Walk-forward", width="stretch")
 
         if run_bt:
             try:
@@ -387,6 +405,7 @@ with col_left:
                         trailing_atr_mult=tr,
                         commission_bps=float(fee_bps),
                     )
+                    params = {"strategy": "MACD_RSI", "rsi_min": float(bt_rsi_min), "macd": f"{int(macd_fast)},{int(macd_slow)},{int(macd_sig)}", "sl_atr": float(sl), "tp_atr": float(tp), "trail_atr": tr}
                 else:
                     bt = botmod.backtest_bbands_meanrev(
                         df,
@@ -399,6 +418,7 @@ with col_left:
                         trailing_atr_mult=tr,
                         commission_bps=float(fee_bps),
                     )
+                    params = {"strategy": "BB_MEANREV", "bb_period": int(bb_period), "bb_mult": float(bb_mult), "rsi_low": float(rsi_low), "rsi_high": float(rsi_high), "sl_atr": float(sl), "tp_atr": max(3.0, float(tp) * 0.7), "trail_atr": tr}
 
                 mt = botmod.backtest_metrics(bt)
                 if not mt.get("ok"):
@@ -417,6 +437,11 @@ with col_left:
                     trd = pd.DataFrame([t for t in (bt.get("trades") or []) if t.get("status") != "OPEN"])
                     if not trd.empty:
                         st.dataframe(trd.tail(50), width="stretch", hide_index=True)
+
+                    if hasattr(botmod, "variant_report"):
+                        rep = botmod.variant_report(bt, params=params, strategy=str(params.get("strategy")))
+                        with st.expander("Отчёт по варианту", expanded=False):
+                            st.json(rep)
             except Exception as e:
                 st.error(f"Backtest error: {e}")
 
@@ -433,6 +458,53 @@ with col_left:
                     st.dataframe(pd.DataFrame(top), width="stretch", hide_index=True)
             except Exception as e:
                 st.error(f"Optimize error: {e}")
+
+        if run_wf:
+            try:
+                if strat.startswith("MACD"):
+                    rows = botmod.walk_forward_optimize_macd_rsi(df, commission_bps=float(fee_bps), train_bars=int(wf_train), test_bars=int(wf_test), step_bars=int(wf_step))
+                else:
+                    rows = botmod.walk_forward_optimize_bbands_meanrev(df, commission_bps=float(fee_bps), train_bars=int(wf_train), test_bars=int(wf_test), step_bars=int(wf_step))
+
+                if not rows:
+                    st.warning("Недостаточно данных для walk-forward")
+                else:
+                    flat = []
+                    for r in rows:
+                        o = r.get("oos") or {}
+                        flat.append(
+                            {
+                                "strategy": r.get("strategy"),
+                                "train_start": r.get("train_start"),
+                                "train_end": r.get("train_end"),
+                                "test_start": r.get("test_start"),
+                                "test_end": r.get("test_end"),
+                                "oos_return_pct": o.get("total_return_pct"),
+                                "oos_max_dd_pct": o.get("max_dd_pct"),
+                                "oos_trades": o.get("trades"),
+                                "oos_win_rate_pct": o.get("win_rate_pct"),
+                                "oos_pf": o.get("profit_factor"),
+                                "oos_sharpe": o.get("sharpe"),
+                                "oos_sortino": o.get("sortino"),
+                                "params": r.get("params"),
+                            }
+                        )
+
+                    df_wf = pd.DataFrame(flat)
+                    st.dataframe(df_wf, width="stretch", hide_index=True)
+
+                    try:
+                        agg = {
+                            "windows": int(len(df_wf)),
+                            "mean_oos_return_pct": float(df_wf["oos_return_pct"].astype(float).mean()),
+                            "mean_oos_max_dd_pct": float(df_wf["oos_max_dd_pct"].astype(float).mean()),
+                            "mean_oos_sortino": float(df_wf["oos_sortino"].astype(float).mean()),
+                        }
+                        st.dataframe(pd.DataFrame([agg]), width="stretch", hide_index=True)
+                    except Exception:
+                        pass
+            except Exception as e:
+                st.error(f"Walk-forward error: {e}")
 
     fig = go.Figure()
     if not df.empty:
