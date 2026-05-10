@@ -117,6 +117,30 @@ def save_config(cfg):
 
 
 CONFIG = load_config()
+_CONFIG_MTIME = os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else 0.0
+
+
+def _reload_config_if_needed():
+    global _CONFIG_MTIME
+    try:
+        if not os.path.exists(CONFIG_FILE):
+            return False
+        mt = float(os.path.getmtime(CONFIG_FILE))
+        if mt <= float(_CONFIG_MTIME or 0.0):
+            return False
+    except Exception:
+        return False
+
+    try:
+        cfg = load_config()
+        with config_lock:
+            CONFIG.update(cfg)
+        _CONFIG_MTIME = mt
+        RUNTIME["config_last_reload_ts"] = time.time()
+        return True
+    except Exception as e:
+        RUNTIME["config_last_reload_error"] = str(e)
+        return False
 
 
 def _append_trade_event(evt):
@@ -143,6 +167,8 @@ RUNTIME = {
     "day_key": None,
     "day_start_balance": None,
     "trading_paused_reason": None,
+    "config_last_reload_ts": None,
+    "config_last_reload_error": None,
 }
 
 # OPTIMIZED PAIRS (by performance analysis)
@@ -3396,6 +3422,7 @@ def dashboard_cmd(m):
 def auto_trade():
     while True:
         try:
+            _reload_config_if_needed()
             RUNTIME["auto_trade_last_loop_ts"] = time.time()
             now = datetime.now()
             prices = {}
