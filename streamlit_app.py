@@ -132,7 +132,11 @@ def _intraday_signal_and_plan(pair: str, tf_norm: str):
 
 
 bg = _start_background()
-rt = getattr(botmod, "RUNTIME", {}) or {}
+try:
+    botmod.account.load_state()
+except Exception:
+    pass
+rt = getattr(getattr(botmod, "account", None), "runtime", {}) or {}
 
 def _fmt_ts(ts):
     if not ts:
@@ -148,13 +152,14 @@ st.markdown(
     """
 <div class="hdr">
   <h1>LocalTRBot — Dashboard</h1>
-  <p>Worker‑режим: торговля и Telegram работают отдельно • last_open: {last_open}</p>
+  <p>Worker‑режим: торговля и Telegram работают отдельно • last_open: {last_open} • worker_ts: {worker_ts}</p>
 </div>
 """.format(
         last_open=(
             f"{_fmt_ts(rt.get('auto_trade_last_open_ts'))} {rt.get('auto_trade_last_open_pair') or ''}".strip()
             or "—"
-        )
+        ),
+        worker_ts=_fmt_ts(rt.get("ts")) if isinstance(rt, dict) else "—",
     ),
     unsafe_allow_html=True,
 )

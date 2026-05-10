@@ -169,6 +169,7 @@ RUNTIME = {
     "trading_paused_reason": None,
     "config_last_reload_ts": None,
     "config_last_reload_error": None,
+    "state_last_save_ts": None,
 }
 
 # OPTIMIZED PAIRS (by performance analysis)
@@ -1729,6 +1730,7 @@ class Account:
         self.peak = self.balance
         self.max_dd = 0
         self.last_report = datetime.now()
+        self.runtime = {}
         self.load_state()
     
     def load_state(self):
@@ -1743,6 +1745,7 @@ class Account:
                 self.positions = data.get("positions", []) or []
                 self.peak = data.get("peak", self.balance)
                 self.max_dd = data.get("max_dd", 0)
+                self.runtime = data.get("runtime", {}) or {}
 
                 ts = data.get("last_report_ts")
                 if ts:
@@ -1763,6 +1766,24 @@ class Account:
                         "peak": self.peak,
                         "max_dd": self.max_dd,
                         "last_report_ts": self.last_report.timestamp() if self.last_report else None,
+                        "runtime": {
+                            **(self.runtime or {}),
+                            "pid": os.getpid(),
+                            "ts": time.time(),
+                            "auto_trade_last_loop_ts": RUNTIME.get("auto_trade_last_loop_ts"),
+                            "auto_trade_last_cycle_ts": RUNTIME.get("auto_trade_last_cycle_ts"),
+                            "auto_trade_last_error": RUNTIME.get("auto_trade_last_error"),
+                            "auto_trade_last_open_ts": RUNTIME.get("auto_trade_last_open_ts"),
+                            "auto_trade_last_open_pair": RUNTIME.get("auto_trade_last_open_pair"),
+                            "auto_trade_last_candidates": RUNTIME.get("auto_trade_last_candidates"),
+                            "auto_trade_last_sample": RUNTIME.get("auto_trade_last_sample"),
+                            "bot_poll_last_error": RUNTIME.get("bot_poll_last_error"),
+                            "trading_paused_reason": RUNTIME.get("trading_paused_reason"),
+                            "day_key": RUNTIME.get("day_key"),
+                            "day_start_balance": RUNTIME.get("day_start_balance"),
+                            "config_last_reload_ts": RUNTIME.get("config_last_reload_ts"),
+                            "config_last_reload_error": RUNTIME.get("config_last_reload_error"),
+                        },
                     },
                     f,
                     indent=2,
@@ -3549,6 +3570,15 @@ def auto_trade():
                 account.save_state()
             
             RUNTIME["auto_trade_last_cycle_ts"] = time.time()
+
+            try:
+                now_ts = time.time()
+                last_save = float(RUNTIME.get("state_last_save_ts") or 0.0)
+                if (now_ts - last_save) >= 30.0:
+                    account.save_state()
+                    RUNTIME["state_last_save_ts"] = now_ts
+            except Exception:
+                pass
 
             try:
                 open_cnt = len([p for p in account.positions if p.get("status") == "OPEN"])
