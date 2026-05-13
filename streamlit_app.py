@@ -590,7 +590,6 @@ with col_left:
                 decreasing_line_color="#FF4D4D",
                 increasing_fillcolor="rgba(0,209,143,0.35)",
                 decreasing_fillcolor="rgba(255,77,77,0.35)",
-                decreasing_fillcolor="rgba(255,77,77,0.35)",
             )
         )
 
