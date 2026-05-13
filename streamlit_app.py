@@ -58,8 +58,30 @@ def _render_pills(items):
 
 @st.cache_resource
 def _start_background():
-    print("[DASH] Streamlit dashboard mode: no bot logic running here", flush=True)
-    return {"started_at": time.time()}
+    run_worker = str(os.environ.get("STREAMLIT_RUN_WORKER", "1") or "1").strip().lower() not in ["0", "false", "no", "off"]
+    started = False
+
+    if run_worker:
+        try:
+            if not bool(getattr(botmod, "_STREAMLIT_WORKER_STARTED", False)):
+                setattr(botmod, "_STREAMLIT_WORKER_STARTED", True)
+
+                threading.Thread(target=botmod.auto_trade, daemon=True).start()
+                if hasattr(botmod, "_worker_data_updater"):
+                    threading.Thread(target=botmod._worker_data_updater, daemon=True).start()
+
+                threading.Thread(target=botmod.run_bot_polling, daemon=True).start()
+
+                if hasattr(botmod, "run_http_server"):
+                    threading.Thread(target=botmod.run_http_server, daemon=True).start()
+
+                started = True
+        except Exception as e:
+            print(f"[DASH] Worker start error: {e}", flush=True)
+    else:
+        print("[DASH] Streamlit dashboard mode: worker disabled (STREAMLIT_RUN_WORKER=0)", flush=True)
+
+    return {"started_at": time.time(), "worker": run_worker, "worker_started": started}
 
 
 def _get_positions_df():
@@ -242,6 +264,7 @@ with col_right:
             leverage = st.number_input("Leverage", min_value=0.1, max_value=1000.0, value=float(cfg["leverage"]), step=1.0)
             check_interval = st.number_input("Check interval (sec)", min_value=5, value=int(cfg["check_interval"]), step=5)
             backtest_commission_bps = st.number_input("Backtest fee (bps)", min_value=0.0, max_value=200.0, value=float(cfg.get("backtest_commission_bps", 0.0) or 0.0), step=0.1)
+            trade_commission_bps = st.number_input("Trade fee (bps)", min_value=0.0, max_value=200.0, value=float(cfg.get("trade_commission_bps", 0.0) or 0.0), step=0.1)
 
         if st.button("Сохранить", width="stretch"):
             botmod.apply_config_patch(
@@ -253,6 +276,7 @@ with col_right:
                     "leverage": leverage,
                     "check_interval": check_interval,
                     "backtest_commission_bps": backtest_commission_bps,
+                    "trade_commission_bps": trade_commission_bps,
                     "goya_score_enabled": goya_score_enabled,
                     "goya_min_score": goya_min_score,
                     "deepseek_enabled": deepseek_enabled,
@@ -341,6 +365,44 @@ with col_left:
         st.info(f"Plan: {'LONG' if plan['direction']==1 else 'SHORT'} Entry {plan['entry']:.5f} • SL {plan['sl']:.5f} • TP {plan['tp']:.5f} • RR {rr_txt}")
     else:
         st.info("Plan: —")
+
+    wave_show = False
+    wave_swings = None
+    wave_impulse = None
+    wave_fibs = None
+
+    with st.expander("Волновой анализ (ZigZag + Elliott)", expanded=False):
+        wave_show = st.checkbox("Показывать на графике", value=True)
+        zz_mult = st.slider("ZigZag чувствительность", min_value=0.5, max_value=3.0, value=1.0, step=0.1)
+        pivots_n = st.slider("Сколько свингов показывать", min_value=6, max_value=24, value=12, step=1)
+
+        try:
+            candles = botmod._df_to_candles(df.tail(1600))
+            base_thr = float(botmod._history_threshold(pair, tf_norm))
+            thr = max(1e-9, base_thr * float(zz_mult))
+            swings = botmod._zigzag_swings(candles, thr)
+            impulse = botmod._elliott_impulse_check(swings)
+            swings = botmod._apply_impulse_labels(swings, impulse)
+            fibs = botmod.get_fib_levels(swings, impulse=impulse)
+
+            wave_swings = (swings or [])[-int(pivots_n):]
+            wave_impulse = impulse
+            wave_fibs = fibs
+
+            st.caption(f"Threshold: {thr:.5f} | Impulse: {'OK' if bool(impulse.get('ok')) else 'NO'} | Dir: {impulse.get('direction')}")
+            if impulse.get("errors"):
+                st.error("\n".join([str(x) for x in (impulse.get("errors") or [])][:4]))
+            if impulse.get("warnings"):
+                st.warning("\n".join([str(x) for x in (impulse.get("warnings") or [])][:4]))
+
+            mt = impulse.get("metrics") or {}
+            if mt:
+                st.json(mt)
+
+            if wave_swings:
+                st.dataframe(pd.DataFrame(wave_swings), width="stretch", hide_index=True)
+        except Exception as e:
+            st.error(f"Wave analysis error: {e}")
 
     with st.expander("Бэктест и оптимизация", expanded=False):
         st.caption("Идея из статьи: быстро проверить стратегию на истории, затем перебрать варианты и сравнить метрики (Sortino/MaxDD/PF).")
@@ -528,6 +590,7 @@ with col_left:
                 decreasing_line_color="#FF4D4D",
                 increasing_fillcolor="rgba(0,209,143,0.35)",
                 decreasing_fillcolor="rgba(255,77,77,0.35)",
+                decreasing_fillcolor="rgba(255,77,77,0.35)",
             )
         )
 
@@ -543,6 +606,56 @@ with col_left:
                     yaxis="y2",
                 )
             )
+
+        if wave_show and wave_swings:
+            xs = []
+            ys = []
+            tx = []
+            for p in (wave_swings or []):
+                try:
+                    xs.append(pd.to_datetime(int(p.get("time") or 0), unit="s", utc=True))
+                    ys.append(float(p.get("price") or 0.0))
+                    tx.append(str(p.get("label") or ""))
+                except Exception:
+                    pass
+
+            if xs and ys:
+                fig.add_trace(
+                    go.Scatter(
+                        x=xs,
+                        y=ys,
+                        mode="lines+markers+text",
+                        name="ZigZag",
+                        text=tx,
+                        textposition="top center",
+                        line=dict(color="rgba(251,146,60,0.95)", width=2),
+                        marker=dict(color="rgba(251,146,60,0.95)", size=7),
+                    )
+                )
+
+        if wave_show and wave_fibs:
+            try:
+                x0 = df.index.min()
+                x1 = df.index.max()
+                for lvl in (wave_fibs or [])[:10]:
+                    y = float(lvl.get("price") or 0.0)
+                    nm = str(lvl.get("name") or "")
+                    if y <= 0:
+                        continue
+                    fig.add_shape(
+                        type="line",
+                        xref="x",
+                        yref="y",
+                        x0=x0,
+                        x1=x1,
+                        y0=y,
+                        y1=y,
+                        line=dict(color="rgba(148,163,184,0.45)", width=1, dash="dot"),
+                    )
+                    if nm:
+                        fig.add_annotation(x=x1, y=y, xref="x", yref="y", text=nm, showarrow=False, xanchor="left", font=dict(size=10, color="rgba(148,163,184,0.9)"))
+            except Exception:
+                pass
 
     fig.update_layout(
         template="plotly_dark",

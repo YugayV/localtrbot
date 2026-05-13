@@ -86,6 +86,7 @@ CONFIG_DEFAULTS = {
     "deepseek_min_confidence": 0.6,
 
     "backtest_commission_bps": 0.0,
+    "trade_commission_bps": 0.0,
 }
 
 
@@ -1800,14 +1801,21 @@ class Account:
         pair = ind['pair']
 
         with config_lock:
-            risk_pct = 10.0
+            risk_pct = float(CONFIG.get("risk_per_trade", 10.0) or 10.0)
             leverage = float(CONFIG["leverage"])
             trailing_stop = bool(CONFIG.get("trailing_stop", True))
             ts_atr_mult = float(CONFIG.get("trailing_stop_atr_multiplier", 1.5))
+            fee_bps = float(CONFIG.get("trade_commission_bps", 0.0) or 0.0)
 
         risk = self.balance * (risk_pct / 100.0)
         atr = float(ind.get("atr") or 0.0)
         sl_dist, tp_dist = get_sl_tp_distance(pair, atr=atr)
+
+        fee_rate = max(0.0, float(fee_bps)) / 10000.0
+        notional = float(risk) * float(leverage)
+        fees_open = float(notional) * float(fee_rate) if fee_rate > 0 else 0.0
+        if fees_open > 0:
+            self.balance -= fees_open
 
         if direction == 1:
             sl_price = ind['price'] - sl_dist
@@ -1833,6 +1841,10 @@ class Account:
             'tp': tp_price,
             'lot': lot,
             'risk': risk,
+            'notional': notional,
+            'fee_bps': fee_bps,
+            'fees_open': fees_open,
+            'fees_close': 0.0,
             'open_ts': now_ts,
             'time': datetime.now().strftime('%H:%M'),
             'status': 'OPEN',
@@ -1894,37 +1906,37 @@ class Account:
                         if new_sl < pos["sl"]:
                             pos["sl"] = new_sl
 
-            # Check TP/SL
+            with config_lock:
+                sl_mult = float(CONFIG.get("sl_atr_multiplier", 2.0))
+                tp_mult = float(CONFIG.get("tp_atr_multiplier", 6.0))
+                fee_bps = float(CONFIG.get("trade_commission_bps", 0.0) or 0.0)
+
+            fee_rate = max(0.0, float(fee_bps)) / 10000.0
+            notional = float(pos.get("notional") or (float(pos.get("risk") or 0.0) * float(CONFIG.get("leverage", 1) or 1)))
+            fees_close = float(notional) * float(fee_rate) if fee_rate > 0 else 0.0
+
+            raw_pnl = None
             if pos['direction'] == 1:
                 if price >= pos['tp']:
-                    # Use ATR multipliers for RR if available
-                    sl_mult = float(CONFIG.get("sl_atr_multiplier", 2.0))
-                    tp_mult = float(CONFIG.get("tp_atr_multiplier", 6.0))
-                    pnl = pos['risk'] * (tp_mult / sl_mult)
+                    raw_pnl = float(pos['risk']) * (tp_mult / max(sl_mult, 1e-9))
                     pos['status'] = 'WIN'
-                    pos['pnl'] = pnl
-                    self.balance += pnl
-                    closed.append(pos)
                 elif price <= pos['sl']:
+                    raw_pnl = -float(pos['risk'])
                     pos['status'] = 'LOSS'
-                    pos['pnl'] = -pos['risk']
-                    self.balance += pos['pnl']
-                    closed.append(pos)
             else:
                 if price <= pos['tp']:
-                    # Use ATR multipliers for RR if available
-                    sl_mult = float(CONFIG.get("sl_atr_multiplier", 2.0))
-                    tp_mult = float(CONFIG.get("tp_atr_multiplier", 6.0))
-                    pnl = pos['risk'] * (tp_mult / sl_mult)
+                    raw_pnl = float(pos['risk']) * (tp_mult / max(sl_mult, 1e-9))
                     pos['status'] = 'WIN'
-                    pos['pnl'] = pnl
-                    self.balance += pnl
-                    closed.append(pos)
                 elif price >= pos['sl']:
+                    raw_pnl = -float(pos['risk'])
                     pos['status'] = 'LOSS'
-                    pos['pnl'] = -pos['risk']
-                    self.balance += pos['pnl']
-                    closed.append(pos)
+
+            if raw_pnl is not None:
+                pos['fees_close'] = float(fees_close)
+                pos['pnl_raw'] = float(raw_pnl)
+                pos['pnl'] = float(raw_pnl) - float(fees_close)
+                self.balance += float(pos['pnl'])
+                closed.append(pos)
         
         close_ts = time.time()
         for pos in closed:
@@ -2920,6 +2932,11 @@ def apply_config_patch(patch):
         out["backtest_commission_bps"] = float(patch["backtest_commission_bps"])
         if out["backtest_commission_bps"] < 0 or out["backtest_commission_bps"] > 200:
             raise ValueError("backtest_commission_bps must be in [0, 200]")
+
+    if "trade_commission_bps" in patch:
+        out["trade_commission_bps"] = float(patch["trade_commission_bps"])
+        if out["trade_commission_bps"] < 0 or out["trade_commission_bps"] > 200:
+            raise ValueError("trade_commission_bps must be in [0, 200]")
 
     with config_lock:
         CONFIG.update(out)
