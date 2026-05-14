@@ -76,7 +76,7 @@ CONFIG_DEFAULTS = {
     "daily_loss_limit_pct": 0.0,
     "close_positions_on_stop": False,
     "goya_score_enabled": True,
-    "goya_min_score": 35,
+    "goya_min_score": 20,
     "goya_rank_candidates": True,
     "deepseek_enabled": False,
     "deepseek_model": "deepseek-v4-flash",
@@ -84,6 +84,10 @@ CONFIG_DEFAULTS = {
     "deepseek_ttl_sec": 300,
     "deepseek_min_local_score": 45,
     "deepseek_min_confidence": 0.6,
+
+    "imbalance_enabled": True,
+    "imbalance_lookback": 220,
+    "imbalance_atr_mult": 1.2,
 
     "backtest_commission_bps": 0.0,
     "trade_commission_bps": 0.0,
@@ -874,7 +878,12 @@ def _goya_score_local(pair, df15, ind15, ind1h, p_up=None):
 
     c_rsi = _clip((rsi15 - 50.0) / 25.0, -1.0, 1.0)
     c_trend15 = 1.0 if trend15 == 1 else (-1.0 if trend15 == -1 else 0.0)
-    c_mom = float(np.tanh(change / 0.03))
+
+    mom_denom = 0.03
+    if vol20 is not None and float(vol20) > 0:
+        k = 3.0 if pair in CRYPTO_PAIRS else 4.0
+        mom_denom = max(1e-9, float(vol20) * k)
+    c_mom = float(np.tanh(change / float(mom_denom)))
 
     c_trend1h = 0.0
     if ind1h is not None:
