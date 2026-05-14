@@ -248,6 +248,15 @@ with col_right:
         st.success(f"Closed: {len(closed)}")
         st.rerun()
 
+    reset_ok = st.checkbox("Подтверждаю сброс счёта до 10000", value=False)
+    if reset_ok and st.button("Сбросить счёт до 10000", width="stretch"):
+        try:
+            botmod.account.reset(10000.0)
+            st.success("Account reset: 10000")
+        except Exception as e:
+            st.error(f"Reset error: {e}")
+        st.rerun()
+
     with st.expander("Настройки", expanded=True):
         cset1, cset2 = st.columns(2)
         with cset1:

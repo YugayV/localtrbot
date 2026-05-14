@@ -1796,7 +1796,36 @@ class Account:
                     os.remove(tmp)
             except Exception:
                 pass
-    
+
+    def reset(self, balance=None):
+        with config_lock:
+            start = float(CONFIG.get("initial_balance", 10000.0) or 10000.0)
+        if balance is not None:
+            try:
+                start = float(balance)
+            except Exception:
+                start = float(start)
+
+        if not (start > 0):
+            start = 10000.0
+
+        self.balance = float(start)
+        self.initial = float(start)
+        self.trades = []
+        self.positions = []
+        self.peak = float(start)
+        self.max_dd = 0.0
+        self.last_report = datetime.now()
+        self.runtime = {}
+
+        RUNTIME["day_key"] = None
+        RUNTIME["day_start_balance"] = float(start)
+        RUNTIME["trading_paused_reason"] = None
+
+        now_ts = time.time()
+        _append_trade_event({"type": "RESET", "ts": now_ts, "balance": float(start)})
+        self.save_state()
+
     def open_trade(self, direction, ind):
         pair = ind['pair']
 
