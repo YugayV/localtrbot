@@ -320,7 +320,7 @@ with col_left:
     with m1:
         st.metric("Цена", f"{price:.5f}" if pair not in (getattr(botmod, "CRYPTO_PAIRS", set()) or set()) else f"{price:.2f}")
     with m2:
-        st.metric("Изменение", f"{change:+.2f}%")
+        st.metric("Изменение", f"{change*100:+.2f}%")
     with m3:
         st.metric("RSI", f"{rsi:.0f}")
     with m4:
@@ -412,6 +412,10 @@ with col_left:
         fee_bps = float((cfg or {}).get("backtest_commission_bps", 0.0) or 0.0)
         st.caption(f"Комиссия (bps): {fee_bps}")
 
+        bt_start = float((cfg or {}).get("initial_balance", 10000.0) or 10000.0)
+        bt_risk_pct = float((cfg or {}).get("risk_per_trade", 10.0) or 10.0)
+        st.caption(f"Стартовый баланс: {bt_start:.0f} | Risk per trade: {bt_risk_pct:.2f}%")
+
         sl = float((cfg or {}).get("sl_atr_multiplier", 2.0))
         tp = float((cfg or {}).get("tp_atr_multiplier", 6.0))
         tr_on = bool((cfg or {}).get("trailing_stop", True))
@@ -471,6 +475,8 @@ with col_left:
                         tp_atr_mult=tp,
                         trailing_atr_mult=tr,
                         commission_bps=float(fee_bps),
+                        initial_equity=float(bt_start),
+                        risk_pct=float(bt_risk_pct),
                     )
                     params = {"strategy": "MACD_RSI", "rsi_min": float(bt_rsi_min), "macd": f"{int(macd_fast)},{int(macd_slow)},{int(macd_sig)}", "sl_atr": float(sl), "tp_atr": float(tp), "trail_atr": tr}
                 else:
@@ -484,6 +490,8 @@ with col_left:
                         tp_atr_mult=max(3.0, float(tp) * 0.7),
                         trailing_atr_mult=tr,
                         commission_bps=float(fee_bps),
+                        initial_equity=float(bt_start),
+                        risk_pct=float(bt_risk_pct),
                     )
                     params = {"strategy": "BB_MEANREV", "bb_period": int(bb_period), "bb_mult": float(bb_mult), "rsi_low": float(rsi_low), "rsi_high": float(rsi_high), "sl_atr": float(sl), "tp_atr": max(3.0, float(tp) * 0.7), "trail_atr": tr}
 

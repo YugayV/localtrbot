@@ -61,7 +61,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "bot_config.json")
 config_lock = threading.Lock()
 
 CONFIG_DEFAULTS = {
-    "initial_balance": 1000.0,
+    "initial_balance": 10000.0,
     "trades_per_pair": 2,
     "max_total_positions": 10,
     "risk_per_trade": 10.0,
@@ -596,7 +596,7 @@ def get_indicators(data, pair_name):
     
     sma = pd.Series(closes).rolling(20).mean().iloc[-1]
     trend = 1 if closes[-1] > sma else -1
-    change = ((closes[-1] - closes[-2]) / closes[-2]) * 100 if len(closes) > 1 else 0
+    change = (closes[-1] / closes[-2] - 1.0) if len(closes) > 1 and float(closes[-2] or 0.0) != 0.0 else 0.0
     
     # Calculate ATR (14-period)
     tr = []
@@ -1016,7 +1016,7 @@ def _deepseek_goya_score(pair, tf_norm, ind15, ind1h, local_score):
         return None
 
 
-def backtest_macd_rsi(df: pd.DataFrame, rsi_min: float = 50.0, macd_fast: int = 12, macd_slow: int = 26, macd_signal: int = 9, sl_atr_mult: float = 2.0, tp_atr_mult: float = 6.0, trailing_atr_mult: float | None = None, commission_bps: float = 0.0):
+def backtest_macd_rsi(df: pd.DataFrame, rsi_min: float = 50.0, macd_fast: int = 12, macd_slow: int = 26, macd_signal: int = 9, sl_atr_mult: float = 2.0, tp_atr_mult: float = 6.0, trailing_atr_mult: float | None = None, commission_bps: float = 0.0, initial_equity: float = 100.0, risk_pct: float = 10.0):
     df = df.copy()
     df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
     if df.empty or len(df) < 60:
@@ -1027,7 +1027,7 @@ def backtest_macd_rsi(df: pd.DataFrame, rsi_min: float = 50.0, macd_fast: int = 
     rsi = _rsi_series(close, 14)
     atr = _atr(df, 14)
 
-    equity = 100.0
+    equity = float(initial_equity) if float(initial_equity) > 0 else 100.0
     eq = []
     trades = []
 
@@ -1076,7 +1076,7 @@ def backtest_macd_rsi(df: pd.DataFrame, rsi_min: float = 50.0, macd_fast: int = 
                 exit_reason = "MACD"
 
         if exit_now:
-            risk = 10.0
+            risk = max(1e-9, float(equity) * (float(risk_pct) / 100.0))
             sl_dist = max(entry - sl, 1e-9)
             rr = (px - entry) / sl_dist
             pnl = risk * rr
@@ -1197,7 +1197,7 @@ def _bbands(close: pd.Series, period: int = 20, mult: float = 2.0):
     return ma, up, lo
 
 
-def backtest_bbands_meanrev(df: pd.DataFrame, bb_period: int = 20, bb_mult: float = 2.0, rsi_low: float = 40.0, rsi_high: float = 60.0, sl_atr_mult: float = 2.0, tp_atr_mult: float = 4.0, trailing_atr_mult: float | None = None, commission_bps: float = 0.0):
+def backtest_bbands_meanrev(df: pd.DataFrame, bb_period: int = 20, bb_mult: float = 2.0, rsi_low: float = 40.0, rsi_high: float = 60.0, sl_atr_mult: float = 2.0, tp_atr_mult: float = 4.0, trailing_atr_mult: float | None = None, commission_bps: float = 0.0, initial_equity: float = 100.0, risk_pct: float = 10.0):
     df = df.copy()
     df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
     if df.empty or len(df) < 80:
@@ -1208,7 +1208,7 @@ def backtest_bbands_meanrev(df: pd.DataFrame, bb_period: int = 20, bb_mult: floa
     atr = _atr(df, 14)
     mid, up, lo = _bbands(close, period=int(bb_period), mult=float(bb_mult))
 
-    equity = 100.0
+    equity = float(initial_equity) if float(initial_equity) > 0 else 100.0
     eq = []
     trades = []
 
@@ -1289,7 +1289,7 @@ def backtest_bbands_meanrev(df: pd.DataFrame, bb_period: int = 20, bb_mult: floa
                 exit_reason = "MID"
 
         if exit_now:
-            risk = 10.0
+            risk = max(1e-9, float(equity) * (float(risk_pct) / 100.0))
             if direction == 1:
                 sl_dist = max(entry - sl, 1e-9)
                 rr = (px - entry) / sl_dist
@@ -3240,7 +3240,7 @@ def market(m):
 
         ind = get_indicators(data.tail(200), pair)
         emoji = "UP" if ind['change'] > 0 else "DOWN"
-        text += f"{pair}: {fp(pair, ind)} ({emoji} {ind['change']:+.2f}%) RSI:{ind['rsi']:.0f}\n"
+        text += f"{pair}: {fp(pair, ind)} ({emoji} {ind['change']*100:+.2f}%) RSI:{ind['rsi']:.0f}\n"
     bot.reply_to(m, text, parse_mode='HTML')
 
 @bot.message_handler(commands=['signal'])
@@ -3334,7 +3334,19 @@ def backtest_cmd(m):
         tr = float(CONFIG.get("trailing_stop_atr_multiplier", 1.5)) if tr_on else None
         fee = float(CONFIG.get("backtest_commission_bps", 0.0) or 0.0)
 
-    bt = backtest_macd_rsi(df, rsi_min=50.0, macd_fast=12, macd_slow=26, macd_signal=9, sl_atr_mult=sl, tp_atr_mult=tp, trailing_atr_mult=tr, commission_bps=fee)
+    bt = backtest_macd_rsi(
+        df,
+        rsi_min=50.0,
+        macd_fast=12,
+        macd_slow=26,
+        macd_signal=9,
+        sl_atr_mult=sl,
+        tp_atr_mult=tp,
+        trailing_atr_mult=tr,
+        commission_bps=fee,
+        initial_equity=float(CONFIG.get("initial_balance", 10000.0) or 10000.0),
+        risk_pct=float(CONFIG.get("risk_per_trade", 10.0) or 10.0),
+    )
     mt = backtest_metrics(bt)
     if not mt.get("ok"):
         bot.reply_to(m, f"Backtest error: {mt.get('error')}")
