@@ -72,7 +72,8 @@ def _start_background():
 
                 threading.Thread(target=botmod.run_bot_polling, daemon=True).start()
 
-                if hasattr(botmod, "run_http_server"):
+                start_bot_http = str(os.environ.get("STREAMLIT_START_BOT_HTTP", "0") or "0").strip().lower() not in ["0", "false", "no", "off"]
+                if start_bot_http and hasattr(botmod, "run_http_server"):
                     threading.Thread(target=botmod.run_http_server, daemon=True).start()
 
                 started = True

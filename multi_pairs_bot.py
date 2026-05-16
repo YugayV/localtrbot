@@ -4051,10 +4051,24 @@ def run_bot_polling():
 
 
 def run_http_server():
-    port = int(os.environ.get("PORT", "8080") or 8080)
-    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
-    print(f"Dashboard: http://0.0.0.0:{port}/")
-    server.serve_forever()
+    base_port = os.environ.get("BOT_HTTP_PORT")
+    port = int((base_port if base_port is not None else os.environ.get("PORT", "8080")) or 8080)
+
+    last_err = None
+    for p in [port] + list(range(port + 1, port + 21)):
+        try:
+            server = ThreadingHTTPServer(("0.0.0.0", int(p)), DashboardHandler)
+            print(f"Dashboard: http://0.0.0.0:{int(p)}/")
+            server.serve_forever()
+            return
+        except OSError as e:
+            last_err = e
+            if int(getattr(e, "errno", 0) or 0) == 98:
+                continue
+            raise
+
+    RUNTIME["http_server_error"] = str(last_err) if last_err else "EADDRINUSE"
+    print(f"HTTP server not started: {RUNTIME['http_server_error']}", flush=True)
 
 
 def _worker_data_updater():
