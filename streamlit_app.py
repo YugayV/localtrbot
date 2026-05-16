@@ -582,7 +582,7 @@ with col_left:
                 elif strat.startswith("MACD"):
                     rows = botmod.walk_forward_optimize_macd_rsi(df, commission_bps=float(fee_bps), train_bars=int(wf_train), test_bars=int(wf_test), step_bars=int(wf_step))
                 else:
-                    rows = botmod.walk_forward_optimize_bbands_meanrev(df, commission_bps=float(fee_bps), train_bars=int(wf_train), test_bars=int(wf_test), step_bars=int(wf_test), step_bars=int(wf_step))
+                    rows = botmod.walk_forward_optimize_bbands_meanrev(df, commission_bps=float(fee_bps), train_bars=int(wf_train), test_bars=int(wf_test), step_bars=int(wf_step))
 
                 if not rows:
                     st.warning("Недостаточно данных для walk-forward")
