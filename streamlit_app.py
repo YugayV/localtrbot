@@ -264,7 +264,15 @@ with col_right:
             max_total_positions = st.number_input("Max total positions", min_value=0, max_value=50, value=int(cfg.get("max_total_positions", 10)), step=1)
             goya_score_enabled = st.selectbox("VitalityScore", ["true", "false"], index=0 if bool(cfg.get("goya_score_enabled", True)) else 1)
             goya_min_score = st.number_input("Vitality min score", min_value=0, max_value=100, value=int(cfg.get("goya_min_score", 35)), step=1)
-            deepseek_enabled = st.selectbox("DeepSeek (AI фильтр)", ["false", "true"], index=1 if bool(cfg.get("deepseek_enabled", False)) else 0)
+
+            signal_mode = st.selectbox("Signal mode", ["ELLIOTT", "CLASSIC"], index=0 if str(cfg.get("signal_mode", "ELLIOTT") or "ELLIOTT").upper().strip() == "ELLIOTT" else 1)
+            elliott_zigzag_mult = st.number_input("Elliott zigzag x", min_value=0.1, max_value=10.0, value=float(cfg.get("elliott_zigzag_mult", 1.0) or 1.0), step=0.05)
+            elliott_corr_mult = st.number_input("Elliott corr x", min_value=0.1, max_value=2.0, value=float(cfg.get("elliott_corr_mult", 0.55) or 0.55), step=0.05)
+            elliott_triangle_break_atr = st.number_input("Elliott break ATR x", min_value=0.0, max_value=5.0, value=float(cfg.get("elliott_triangle_break_atr", 0.20) or 0.20), step=0.05)
+            elliott_fib_min = st.number_input("Elliott fib min", min_value=0.0, max_value=2.0, value=float(cfg.get("elliott_fib_min", 0.382) or 0.382), step=0.01)
+            elliott_fib_max = st.number_input("Elliott fib max", min_value=0.0, max_value=2.0, value=float(cfg.get("elliott_fib_max", 0.618) or 0.618), step=0.01)
+            elliott_require_golden = st.selectbox("Require golden (0.618)", ["false", "true"], index=1 if bool(cfg.get("elliott_require_golden", False)) else 0)
+
             show_ai_indicators = st.selectbox("Показывать AI индикаторы", ["false", "true"], index=1 if bool(st.session_state.get("show_ai_indicators", False)) else 0)
             st.session_state["show_ai_indicators"] = (show_ai_indicators == "true")
         with cset2:
@@ -286,9 +294,15 @@ with col_right:
                     "check_interval": check_interval,
                     "backtest_commission_bps": backtest_commission_bps,
                     "trade_commission_bps": trade_commission_bps,
+                    "signal_mode": signal_mode,
+                    "elliott_zigzag_mult": elliott_zigzag_mult,
+                    "elliott_corr_mult": elliott_corr_mult,
+                    "elliott_triangle_break_atr": elliott_triangle_break_atr,
+                    "elliott_fib_min": elliott_fib_min,
+                    "elliott_fib_max": elliott_fib_max,
+                    "elliott_require_golden": elliott_require_golden,
                     "goya_score_enabled": goya_score_enabled,
                     "goya_min_score": goya_min_score,
-                    "deepseek_enabled": deepseek_enabled,
                 }
             )
             st.success("Сохранено")
@@ -416,7 +430,7 @@ with col_left:
     with st.expander("Бэктест и оптимизация", expanded=False):
         st.caption("Идея из статьи: быстро проверить стратегию на истории, затем перебрать варианты и сравнить метрики (Sortino/MaxDD/PF).")
 
-        strat = st.selectbox("Стратегия", ["MACD+RSI (моментум)", "Bollinger (mean-reversion)"], index=0)
+        strat = st.selectbox("Стратегия", ["Elliott+Fibo (Wave4 triangle)", "MACD+RSI (моментум)", "Bollinger (mean-reversion)"], index=0)
 
         fee_bps = float((cfg or {}).get("backtest_commission_bps", 0.0) or 0.0)
         st.caption(f"Комиссия (bps): {fee_bps}")
@@ -473,7 +487,21 @@ with col_left:
 
         if run_bt:
             try:
-                if strat.startswith("MACD"):
+                if strat.startswith("Elliott"):
+                    if tf != "15m":
+                        st.warning("Для Elliott+Fibo рекомендуется 15m (интрадей).")
+                    bt = botmod.backtest_elliott_triangle(
+                        df,
+                        pair=str(pair),
+                        sl_atr_mult=sl,
+                        tp_atr_mult=tp,
+                        trailing_atr_mult=tr,
+                        commission_bps=float(fee_bps),
+                        initial_equity=float(bt_start),
+                        risk_pct=float(bt_risk_pct),
+                    )
+                    params = {"strategy": "ELLIOTT_TRIANGLE", "sl_atr": float(sl), "tp_atr": float(tp), "trail_atr": tr}
+                elif strat.startswith("MACD"):
                     bt = botmod.backtest_macd_rsi(
                         df,
                         rsi_min=float(bt_rsi_min),
@@ -531,7 +559,10 @@ with col_left:
 
         if run_opt:
             try:
-                if strat.startswith("MACD"):
+                if strat.startswith("Elliott"):
+                    st.warning("Оптимизация не включена для Elliott+Fibo")
+                    top = None
+                elif strat.startswith("MACD"):
                     top = botmod.optimize_macd_rsi(df, commission_bps=float(fee_bps), top_n=5)
                 else:
                     top = botmod.optimize_bbands_meanrev(df, commission_bps=float(fee_bps), top_n=5)
@@ -545,10 +576,13 @@ with col_left:
 
         if run_wf:
             try:
-                if strat.startswith("MACD"):
+                if strat.startswith("Elliott"):
+                    st.warning("Walk-forward не включён для Elliott+Fibo")
+                    rows = None
+                elif strat.startswith("MACD"):
                     rows = botmod.walk_forward_optimize_macd_rsi(df, commission_bps=float(fee_bps), train_bars=int(wf_train), test_bars=int(wf_test), step_bars=int(wf_step))
                 else:
-                    rows = botmod.walk_forward_optimize_bbands_meanrev(df, commission_bps=float(fee_bps), train_bars=int(wf_train), test_bars=int(wf_test), step_bars=int(wf_step))
+                    rows = botmod.walk_forward_optimize_bbands_meanrev(df, commission_bps=float(fee_bps), train_bars=int(wf_train), test_bars=int(wf_test), step_bars=int(wf_test), step_bars=int(wf_step))
 
                 if not rows:
                     st.warning("Недостаточно данных для walk-forward")

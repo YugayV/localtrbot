@@ -75,6 +75,15 @@ CONFIG_DEFAULTS = {
     "daily_profit_target_pct": 0.0,
     "daily_loss_limit_pct": 0.0,
     "close_positions_on_stop": False,
+
+    "signal_mode": "ELLIOTT",
+    "elliott_zigzag_mult": 1.0,
+    "elliott_corr_mult": 0.55,
+    "elliott_triangle_break_atr": 0.20,
+    "elliott_fib_min": 0.382,
+    "elliott_fib_max": 0.618,
+    "elliott_require_golden": False,
+
     "goya_score_enabled": True,
     "goya_min_score": 20,
     "goya_rank_candidates": True,
@@ -1335,6 +1344,136 @@ def backtest_bbands_meanrev(df: pd.DataFrame, bb_period: int = 20, bb_mult: floa
     return {"equity": eq, "trades": trades}
 
 
+
+def backtest_elliott_triangle(df: pd.DataFrame, pair: str = "EURUSD", sl_atr_mult: float = 2.0, tp_atr_mult: float = 6.0, trailing_atr_mult: float | None = None, commission_bps: float = 0.0, initial_equity: float = 100.0, risk_pct: float = 10.0):
+    df = df.copy()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if df.empty or len(df) < 220:
+        return {"equity": [], "trades": [], "error": "not enough data"}
+
+    close = df["Close"].astype(float)
+    atr = _atr(df, 14)
+
+    equity = float(initial_equity) if float(initial_equity) > 0 else 100.0
+    eq = []
+    trades = []
+
+    in_pos = False
+    direction = 0
+    entry = 0.0
+    sl = 0.0
+    tp = 0.0
+    peak = 0.0
+
+    for i in range(220, len(df)):
+        ts = df.index[i]
+        px = float(close.iloc[i])
+        eq.append({"t": ts, "equity": float(equity)})
+
+        a = float(atr.iloc[i] or 0.0)
+        if a <= 0:
+            continue
+
+        df_i = df.iloc[: i + 1]
+        ind_i = get_indicators(df_i, pair)
+        sig, _, _ = _elliott_wave4_triangle_signal(pair, df_i, ind_i, enforce_hours=False)
+
+        if not in_pos:
+            if sig == 0:
+                continue
+            in_pos = True
+            direction = int(sig)
+            entry = px
+            if direction == 1:
+                sl = entry - (float(sl_atr_mult) * a)
+                tp = entry + (float(tp_atr_mult) * a)
+                peak = entry
+            else:
+                sl = entry + (float(sl_atr_mult) * a)
+                tp = entry - (float(tp_atr_mult) * a)
+                peak = entry
+
+            trades.append({"direction": direction, "open_t": ts, "entry": entry, "sl": sl, "tp": tp, "close_t": None, "exit": None, "pnl": 0.0, "status": "OPEN", "exit_reason": None})
+            continue
+
+        if direction == 1:
+            if px > peak:
+                peak = px
+            if trailing_atr_mult is not None:
+                tsl = float(peak) - (float(trailing_atr_mult) * a)
+                if tsl > sl:
+                    sl = tsl
+        else:
+            if px < peak:
+                peak = px
+            if trailing_atr_mult is not None:
+                tsl = float(peak) + (float(trailing_atr_mult) * a)
+                if tsl < sl:
+                    sl = tsl
+
+        exit_now = False
+        exit_reason = None
+
+        if direction == 1:
+            if px <= sl:
+                exit_now = True
+                exit_reason = "SL"
+            elif px >= tp:
+                exit_now = True
+                exit_reason = "TP"
+            elif sig == -1:
+                exit_now = True
+                exit_reason = "REV"
+        else:
+            if px >= sl:
+                exit_now = True
+                exit_reason = "SL"
+            elif px <= tp:
+                exit_now = True
+                exit_reason = "TP"
+            elif sig == 1:
+                exit_now = True
+                exit_reason = "REV"
+
+        if exit_now:
+            risk = max(1e-9, float(equity) * (float(risk_pct) / 100.0))
+            if direction == 1:
+                sl_dist = max(entry - sl, 1e-9)
+                rr = (px - entry) / sl_dist
+            else:
+                sl_dist = max(sl - entry, 1e-9)
+                rr = (entry - px) / sl_dist
+
+            pnl = risk * rr
+            pnl = max(-risk, min(pnl, risk * (float(tp_atr_mult) / max(float(sl_atr_mult), 1e-9))))
+
+            fees = float(commission_bps) / 10000.0
+            if fees > 0:
+                pnl -= abs(pnl) * fees
+
+            equity += pnl
+
+            t = trades[-1]
+            t["close_t"] = ts
+            t["exit"] = px
+            t["pnl"] = float(pnl)
+            t["status"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+            t["exit_reason"] = exit_reason
+
+            in_pos = False
+            direction = 0
+            entry = 0.0
+            sl = 0.0
+            tp = 0.0
+            peak = 0.0
+
+    if eq and eq[-1]["t"] != df.index[-1]:
+        eq.append({"t": df.index[-1], "equity": float(equity)})
+
+    return {"equity": eq, "trades": trades}
+
+
+
 def optimize_bbands_meanrev(df: pd.DataFrame, commission_bps: float = 0.0, top_n: int = 5):
     bb_periods = [20]
     bb_mults = [1.5, 2.0, 2.5]
@@ -1602,7 +1741,17 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
     ind15 = get_indicators(d15, pair)
     ind1h = get_indicators(d1h, pair)
 
-    sig15, reasons = check_signal(ind15, enforce_hours=enforce_hours)
+    with config_lock:
+        mode = str(CONFIG.get("signal_mode", "ELLIOTT") or "ELLIOTT").upper().strip()
+
+    if mode == "ELLIOTT":
+        sig15, reasons, imp = _elliott_wave4_triangle_signal(pair, d15, ind15, enforce_hours=enforce_hours)
+        if imp is not None and imp.get("direction") is not None:
+            reasons = list(reasons or [])
+            reasons.append(f"Impulse dir: {imp.get('direction')}")
+    else:
+        sig15, reasons = check_signal(ind15, enforce_hours=enforce_hours)
+
     sig = sig15
 
     reasons = list(reasons)
@@ -2718,6 +2867,158 @@ def _elliott_impulse_check(swings):
     return out
 
 
+def _line_at(p0, p1, t):
+    t0 = int(p0.get("time") or 0)
+    t1 = int(p1.get("time") or 0)
+    y0 = float(p0.get("price") or 0.0)
+    y1 = float(p1.get("price") or 0.0)
+    if t1 == t0:
+        return y1
+    return y0 + (y1 - y0) * ((float(t) - float(t0)) / (float(t1) - float(t0)))
+
+
+def _triangle_from_swings(swings, now_t, atr, break_atr_mult):
+    if not swings or len(swings) < 4:
+        return None
+
+    pts = swings[-4:]
+    kinds = [p.get("kind") for p in pts]
+    if kinds not in (["L", "H", "L", "H"], ["H", "L", "H", "L"]):
+        return None
+
+    highs = [p for p in pts if p.get("kind") == "H"]
+    lows = [p for p in pts if p.get("kind") == "L"]
+    if len(highs) != 2 or len(lows) != 2:
+        return None
+
+    h0, h1 = highs[0], highs[1]
+    l0, l1 = lows[0], lows[1]
+
+    if float(h1.get("price") or 0) >= float(h0.get("price") or 0):
+        return None
+    if float(l1.get("price") or 0) <= float(l0.get("price") or 0):
+        return None
+
+    up_now = _line_at(h0, h1, now_t)
+    lo_now = _line_at(l0, l1, now_t)
+
+    if not (lo_now < up_now):
+        return None
+
+    atr = float(atr or 0.0)
+    pad = max(0.0, atr * float(break_atr_mult))
+
+    return {
+        "upper": {"p0": h0, "p1": h1, "now": float(up_now)},
+        "lower": {"p0": l0, "p1": l1, "now": float(lo_now)},
+        "pad": float(pad),
+        "touches": pts,
+    }
+
+
+def _elliott_wave4_triangle_signal(pair, df15, ind15, enforce_hours=True):
+    if enforce_hours and get_seoul_time().hour not in GOOD_HOURS:
+        return 0, ["Hours filter"], None
+
+    with config_lock:
+        zz_mult = float(CONFIG.get("elliott_zigzag_mult", 1.0) or 1.0)
+        corr_mult = float(CONFIG.get("elliott_corr_mult", 0.55) or 0.55)
+        break_atr_mult = float(CONFIG.get("elliott_triangle_break_atr", 0.20) or 0.20)
+        fib_min = float(CONFIG.get("elliott_fib_min", 0.382) or 0.382)
+        fib_max = float(CONFIG.get("elliott_fib_max", 0.618) or 0.618)
+        req_golden = bool(CONFIG.get("elliott_require_golden", False))
+
+    candles = _df_to_candles(df15.tail(600))
+    if len(candles) < 120:
+        return 0, ["No data"], None
+
+    base_thr = float(_history_threshold(pair, "15m")) * float(zz_mult)
+    base_thr = float(max(1e-6, base_thr))
+
+    swings = _zigzag_swings(candles, base_thr)
+    imp = _elliott_impulse_check(swings)
+    if not bool(imp.get("ok")):
+        return 0, [(imp.get("errors") or ["No impulse"])[0]], imp
+
+    pts = imp.get("points") or []
+    if len(pts) < 4:
+        return 0, ["Impulse points missing"], imp
+
+    direction = int(imp.get("direction") or 0)
+    p0, p1, p2, p3 = pts[0], pts[1], pts[2], pts[3]
+    w2 = float(p2.get("price") or 0.0)
+    w3 = float(p3.get("price") or 0.0)
+    t3 = int(p3.get("time") or 0)
+
+    seg = [c for c in candles if int(c.get("time") or 0) >= t3]
+    if len(seg) < 60:
+        return 0, ["Wave4 segment too short"], imp
+
+    corr_thr = float(max(1e-6, base_thr * float(corr_mult)))
+    corr_sw = _zigzag_swings(seg, corr_thr)
+
+    now = candles[-1]
+    now_t = int(now.get("time") or 0)
+    now_px = float(now.get("close") or 0.0)
+
+    tri = _triangle_from_swings(corr_sw, now_t, float(ind15.get("atr") or 0.0), break_atr_mult)
+    if tri is None:
+        return 0, ["No triangle"], imp
+
+    w3_move = abs(float(w3) - float(w2))
+
+    corr_low = None
+    corr_high = None
+    for p in corr_sw:
+        if p.get("kind") == "L":
+            corr_low = float(p.get("price") or 0.0) if corr_low is None else min(corr_low, float(p.get("price") or 0.0))
+        if p.get("kind") == "H":
+            corr_high = float(p.get("price") or 0.0) if corr_high is None else max(corr_high, float(p.get("price") or 0.0))
+
+    fib_ratio = None
+    if w3_move > 0 and corr_low is not None and corr_high is not None:
+        if direction == 1:
+            fib_ratio = abs(float(w3) - float(corr_low)) / w3_move
+        elif direction == -1:
+            fib_ratio = abs(float(corr_high) - float(w3)) / w3_move
+
+    ok_fib = True
+    golden = False
+    if fib_ratio is not None:
+        ok_fib = (float(fib_ratio) >= float(fib_min)) and (float(fib_ratio) <= float(fib_max))
+        golden = abs(float(fib_ratio) - 0.618) <= 0.03
+    if req_golden and not golden:
+        ok_fib = False
+
+    reasons = []
+    if fib_ratio is not None:
+        reasons.append(f"Fib(W4 vs W3): {float(fib_ratio):.3f}{' GOLDEN' if golden else ''}")
+    else:
+        reasons.append("Fib: n/a")
+
+    upper = float((tri.get("upper") or {}).get("now") or 0.0)
+    lower = float((tri.get("lower") or {}).get("now") or 0.0)
+    pad = float(tri.get("pad") or 0.0)
+
+    if not ok_fib:
+        reasons.append("Filter: fib not in range")
+        return 0, reasons, imp
+
+    if direction == 1:
+        if now_px > upper + pad:
+            reasons.append("Elliott: Wave4 triangle breakout UP")
+            return 1, reasons, imp
+        return 0, reasons, imp
+
+    if direction == -1:
+        if now_px < lower - pad:
+            reasons.append("Elliott: Wave4 triangle breakout DOWN")
+            return -1, reasons, imp
+        return 0, reasons, imp
+
+    return 0, reasons, imp
+
+
 def _apply_impulse_labels(swings, impulse):
     out = [dict(p) for p in (swings or [])]
 
@@ -2928,6 +3229,40 @@ def apply_config_patch(patch):
 
     if "close_positions_on_stop" in patch:
         out["close_positions_on_stop"] = to_bool(patch["close_positions_on_stop"])
+
+    if "signal_mode" in patch:
+        mode = str(patch["signal_mode"] or "").strip().upper()
+        if mode not in ["CLASSIC", "ELLIOTT"]:
+            raise ValueError("signal_mode must be CLASSIC or ELLIOTT")
+        out["signal_mode"] = mode
+
+    if "elliott_zigzag_mult" in patch:
+        out["elliott_zigzag_mult"] = float(patch["elliott_zigzag_mult"])
+        if out["elliott_zigzag_mult"] <= 0 or out["elliott_zigzag_mult"] > 10:
+            raise ValueError("elliott_zigzag_mult must be in (0, 10]")
+
+    if "elliott_corr_mult" in patch:
+        out["elliott_corr_mult"] = float(patch["elliott_corr_mult"])
+        if out["elliott_corr_mult"] <= 0 or out["elliott_corr_mult"] > 2:
+            raise ValueError("elliott_corr_mult must be in (0, 2]")
+
+    if "elliott_triangle_break_atr" in patch:
+        out["elliott_triangle_break_atr"] = float(patch["elliott_triangle_break_atr"])
+        if out["elliott_triangle_break_atr"] < 0 or out["elliott_triangle_break_atr"] > 5:
+            raise ValueError("elliott_triangle_break_atr must be in [0, 5]")
+
+    if "elliott_fib_min" in patch:
+        out["elliott_fib_min"] = float(patch["elliott_fib_min"])
+        if out["elliott_fib_min"] < 0 or out["elliott_fib_min"] > 2:
+            raise ValueError("elliott_fib_min must be in [0, 2]")
+
+    if "elliott_fib_max" in patch:
+        out["elliott_fib_max"] = float(patch["elliott_fib_max"])
+        if out["elliott_fib_max"] < 0 or out["elliott_fib_max"] > 2:
+            raise ValueError("elliott_fib_max must be in [0, 2]")
+
+    if "elliott_require_golden" in patch:
+        out["elliott_require_golden"] = to_bool(patch["elliott_require_golden"])
 
     if "goya_score_enabled" in patch:
         out["goya_score_enabled"] = to_bool(patch["goya_score_enabled"])
@@ -3346,7 +3681,7 @@ def backtest_cmd(m):
     parts = (m.text or "").strip().split()
     pair = parts[1].upper().strip() if len(parts) >= 2 else "EURUSD"
     tf = parts[2].lower().strip() if len(parts) >= 3 else "1h"
-
+    strat = parts[3].upper().strip() if len(parts) >= 4 else "ELLIOTT"
     if pair not in PAIRS:
         bot.reply_to(m, f"Unknown pair: {pair}")
         return
@@ -3372,19 +3707,31 @@ def backtest_cmd(m):
         tr = float(CONFIG.get("trailing_stop_atr_multiplier", 1.5)) if tr_on else None
         fee = float(CONFIG.get("backtest_commission_bps", 0.0) or 0.0)
 
-    bt = backtest_macd_rsi(
-        df,
-        rsi_min=50.0,
-        macd_fast=12,
-        macd_slow=26,
-        macd_signal=9,
-        sl_atr_mult=sl,
-        tp_atr_mult=tp,
-        trailing_atr_mult=tr,
-        commission_bps=fee,
-        initial_equity=float(CONFIG.get("initial_balance", 10000.0) or 10000.0),
-        risk_pct=float(CONFIG.get("risk_per_trade", 10.0) or 10.0),
-    )
+    if strat in ["ELLIOTT", "ELLIOTT_TRIANGLE", "WAVES"]:
+        bt = backtest_elliott_triangle(
+            df,
+            pair=pair,
+            sl_atr_mult=sl,
+            tp_atr_mult=tp,
+            trailing_atr_mult=tr,
+            commission_bps=fee,
+            initial_equity=float(CONFIG.get("initial_balance", 10000.0) or 10000.0),
+            risk_pct=float(CONFIG.get("risk_per_trade", 10.0) or 10.0),
+        )
+    else:
+        bt = backtest_macd_rsi(
+            df,
+            rsi_min=50.0,
+            macd_fast=12,
+            macd_slow=26,
+            macd_signal=9,
+            sl_atr_mult=sl,
+            tp_atr_mult=tp,
+            trailing_atr_mult=tr,
+            commission_bps=fee,
+            initial_equity=float(CONFIG.get("initial_balance", 10000.0) or 10000.0),
+            risk_pct=float(CONFIG.get("risk_per_trade", 10.0) or 10.0),
+        )
     mt = backtest_metrics(bt)
     if not mt.get("ok"):
         bot.reply_to(m, f"Backtest error: {mt.get('error')}")
