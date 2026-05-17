@@ -333,6 +333,12 @@ def update_market_data(pair, tf="15m", bars=3000, min_age_sec=300, force=False, 
         if parts:
             df_new = pd.concat(parts).sort_index()
             df_new = df_new[~df_new.index.duplicated(keep="last")]
+        else:
+            ticker = PAIRS.get(pair)
+            if ticker is not None:
+                period = "5d" if tf_norm == "15m" else "60d"
+                interval = "15m" if tf_norm == "15m" else "1h"
+                df_new = get_data(ticker, period=period, interval=interval)
     else:
         ticker = PAIRS.get(pair)
         if ticker is not None:
