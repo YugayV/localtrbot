@@ -76,7 +76,13 @@ CONFIG_DEFAULTS = {
     "daily_loss_limit_pct": 0.0,
     "close_positions_on_stop": False,
 
-    "signal_mode": "ELLIOTT",
+    "signal_mode": "SMC",
+
+    "smc_pivot_period": 5,
+    "smc_ob_lookback": 280,
+    "smc_use_fvg": True,
+    "smc_fvg_min_atr": 0.2,
+
     "elliott_zigzag_mult": 1.0,
     "elliott_corr_mult": 0.55,
     "elliott_triangle_break_atr": 0.20,
@@ -1748,15 +1754,23 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
     ind1h = get_indicators(d1h, pair)
 
     with config_lock:
-        mode = str(CONFIG.get("signal_mode", "ELLIOTT") or "ELLIOTT").upper().strip()
+        mode = str(CONFIG.get("signal_mode", "SMC") or "SMC").upper().strip()
+
+    if mode == "SMC":
+        sig15, reasons, _ = _smc_intraday_signal(pair, d15, ind15)
+        reasons = list(reasons or [])
+        reasons.append("Mode: SMC")
+        return sig15, reasons, ind15, ind1h
 
     if mode == "ELLIOTT":
         sig15, reasons, imp = _elliott_wave4_triangle_signal(pair, d15, ind15, enforce_hours=enforce_hours)
+        reasons = list(reasons or [])
         if imp is not None and imp.get("direction") is not None:
-            reasons = list(reasons or [])
             reasons.append(f"Impulse dir: {imp.get('direction')}")
-    else:
-        sig15, reasons = check_signal(ind15, enforce_hours=enforce_hours)
+        reasons.append("Mode: ELLIOTT")
+        return sig15, reasons, ind15, ind1h
+
+    sig15, reasons = check_signal(ind15, enforce_hours=enforce_hours)
 
     sig = sig15
 
@@ -3096,6 +3110,341 @@ def get_fib_levels(swings, impulse=None):
     return levels
 
 
+def _to_utc_ts(ts):
+    if isinstance(ts, pd.Timestamp):
+        ts = ts.to_pydatetime()
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = ts.astimezone(timezone.utc)
+        return int(ts.timestamp())
+    return int(time.time())
+
+
+def _smc_pivots(df: pd.DataFrame, pp: int):
+    pp = int(pp)
+    if df is None or df.empty or pp < 1 or len(df) < (pp * 2 + 5):
+        return []
+
+    h = df["High"].astype(float).values
+    l = df["Low"].astype(float).values
+    idx = df.index
+
+    piv = []
+    for i in range(pp, len(df) - pp):
+        hi = h[i]
+        lo = l[i]
+        if hi == np.max(h[i - pp : i + pp + 1]):
+            piv.append({"i": int(i), "time": _to_utc_ts(idx[i]), "price": float(hi), "kind": "H"})
+        if lo == np.min(l[i - pp : i + pp + 1]):
+            piv.append({"i": int(i), "time": _to_utc_ts(idx[i]), "price": float(lo), "kind": "L"})
+
+    piv.sort(key=lambda x: int(x.get("i") or 0))
+
+    out = []
+    last_kind = None
+    for p in piv:
+        k = p.get("kind")
+        if k == last_kind:
+            continue
+        out.append(p)
+        last_kind = k
+
+    return out
+
+
+def _smc_fvgs(df: pd.DataFrame, min_atr_mult: float = 0.2, max_n: int = 18):
+    if df is None or df.empty or len(df) < 40:
+        return []
+
+    atr = _atr(df, 14)
+    out = []
+
+    for i in range(2, len(df)):
+        a = float(atr.iloc[i] or 0.0)
+        if a <= 0:
+            continue
+
+        hi2 = float(df["High"].iloc[i - 2])
+        lo2 = float(df["Low"].iloc[i - 2])
+        hi0 = float(df["High"].iloc[i])
+        lo0 = float(df["Low"].iloc[i])
+        ts = _to_utc_ts(df.index[i])
+
+        if lo0 > hi2:
+            w = float(lo0 - hi2)
+            if w >= float(a) * float(min_atr_mult):
+                out.append({"dir": 1, "low": float(hi2), "high": float(lo0), "time": ts})
+
+        if hi0 < lo2:
+            w = float(lo2 - hi0)
+            if w >= float(a) * float(min_atr_mult):
+                out.append({"dir": -1, "low": float(hi0), "high": float(lo2), "time": ts})
+
+    return out[-int(max_n) :]
+
+
+def smc_overlay(df: pd.DataFrame, pair: str):
+    with config_lock:
+        pp = int(CONFIG.get("smc_pivot_period", 5) or 5)
+        ob_lookback = int(CONFIG.get("smc_ob_lookback", 280) or 280)
+        fvg_on = bool(CONFIG.get("smc_use_fvg", True))
+        fvg_min_atr = float(CONFIG.get("smc_fvg_min_atr", 0.2) or 0.2)
+
+    df = (df.tail(int(ob_lookback)) if df is not None else df)
+    if df is None or df.empty:
+        return {"ok": False, "obs": [], "fvgs": [], "events": []}
+
+    piv = _smc_pivots(df, pp)
+    last_h = None
+    last_l = None
+    struct_dir = 0
+    events = []
+    obs = []
+
+    for p in piv:
+        if p.get("kind") == "H":
+            last_h = p
+        else:
+            last_l = p
+
+    if last_h is None or last_l is None:
+        return {"ok": True, "obs": [], "fvgs": (_smc_fvgs(df, fvg_min_atr) if fvg_on else []), "events": []}
+
+    close = df["Close"].astype(float).values
+    open_ = df["Open"].astype(float).values
+
+    lh_i = int(last_h.get("i") or 0)
+    ll_i = int(last_l.get("i") or 0)
+    start_i = max(0, min(lh_i, ll_i) - 5)
+
+    last_h_price = float(last_h.get("price") or 0.0)
+    last_l_price = float(last_l.get("price") or 0.0)
+
+    for i in range(start_i, len(df)):
+        c = float(close[i])
+
+        if c > last_h_price and last_h_price > 0:
+            struct_dir = 1
+            ts = _to_utc_ts(df.index[i])
+            events.append({"kind": "BOS", "dir": 1, "time": ts, "price": float(last_h_price)})
+
+            j0 = max(0, i - 12)
+            ob_i = None
+            for j in range(i - 1, j0 - 1, -1):
+                if float(close[j]) < float(open_[j]):
+                    ob_i = j
+                    break
+            if ob_i is not None:
+                obs.append({"type": "OB", "dir": 1, "time": _to_utc_ts(df.index[ob_i]), "low": float(df["Low"].iloc[ob_i]), "high": float(df["High"].iloc[ob_i])})
+
+            for p in piv:
+                if int(p.get("i") or 0) > i and p.get("kind") == "H":
+                    last_h_price = float(p.get("price") or last_h_price)
+                    break
+
+        if c < last_l_price and last_l_price > 0:
+            struct_dir = -1
+            ts = _to_utc_ts(df.index[i])
+            events.append({"kind": "BOS", "dir": -1, "time": ts, "price": float(last_l_price)})
+
+            j0 = max(0, i - 12)
+            ob_i = None
+            for j in range(i - 1, j0 - 1, -1):
+                if float(close[j]) > float(open_[j]):
+                    ob_i = j
+                    break
+            if ob_i is not None:
+                obs.append({"type": "OB", "dir": -1, "time": _to_utc_ts(df.index[ob_i]), "low": float(df["Low"].iloc[ob_i]), "high": float(df["High"].iloc[ob_i])})
+
+            for p in piv:
+                if int(p.get("i") or 0) > i and p.get("kind") == "L":
+                    last_l_price = float(p.get("price") or last_l_price)
+                    break
+
+    fvgs = _smc_fvgs(df, min_atr_mult=fvg_min_atr) if fvg_on else []
+
+    obs = obs[-8:]
+    events = events[-12:]
+
+    return {"ok": True, "dir": int(struct_dir), "obs": obs, "fvgs": fvgs, "events": events}
+
+
+def _smc_intraday_signal(pair: str, df15: pd.DataFrame, ind15: dict):
+    reasons = []
+    overlay = smc_overlay(df15.tail(600), pair)
+    if not overlay.get("ok"):
+        return 0, ["SMC: no overlay"], overlay
+
+    struct_dir = int(overlay.get("dir") or 0)
+    obs = overlay.get("obs") or []
+    fvgs = overlay.get("fvgs") or []
+
+    px = float(ind15.get("price") or 0.0)
+    low = float(df15["Low"].astype(float).iloc[-1])
+    high = float(df15["High"].astype(float).iloc[-1])
+    close = float(df15["Close"].astype(float).iloc[-1])
+
+    zone = None
+    for z in reversed(obs):
+        if z.get("type") == "OB":
+            zone = z
+            break
+
+    if zone is None and fvgs:
+        zone = fvgs[-1]
+
+    if zone is None:
+        return 0, ["SMC: no zones"], overlay
+
+    z_low = float(zone.get("low") or 0.0)
+    z_high = float(zone.get("high") or 0.0)
+    z_dir = int(zone.get("dir") or 0)
+    reasons.append(f"SMC dir={struct_dir} zone={'OB' if zone.get('type')=='OB' else 'FVG'} {z_low:.5f}-{z_high:.5f}")
+
+    if z_dir == 1 and struct_dir >= 0:
+        if low <= z_high and close > z_high:
+            reasons.append("SMC: demand mitigation -> LONG")
+            return 1, reasons, overlay
+
+    if z_dir == -1 and struct_dir <= 0:
+        if high >= z_low and close < z_low:
+            reasons.append("SMC: supply mitigation -> SHORT")
+            return -1, reasons, overlay
+
+    reasons.append("SMC: wait")
+    return 0, reasons, overlay
+
+
+def backtest_smc(df: pd.DataFrame, pair: str = "EURUSD", sl_atr_mult: float = 2.0, tp_atr_mult: float = 6.0, trailing_atr_mult: float | None = None, commission_bps: float = 0.0, initial_equity: float = 100.0, risk_pct: float = 10.0):
+    df = df.copy()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if df.empty or len(df) < 220:
+        return {"equity": [], "trades": [], "error": "not enough data"}
+
+    close = df["Close"].astype(float)
+    atr = _atr(df, 14)
+
+    equity = float(initial_equity) if float(initial_equity) > 0 else 100.0
+    eq = []
+    trades = []
+
+    in_pos = False
+    direction = 0
+    entry = 0.0
+    sl = 0.0
+    tp = 0.0
+    peak = 0.0
+
+    for i in range(220, len(df)):
+        ts = df.index[i]
+        px = float(close.iloc[i])
+        eq.append({"t": ts, "equity": float(equity)})
+
+        a = float(atr.iloc[i] or 0.0)
+        if a <= 0:
+            continue
+
+        df_i = df.iloc[: i + 1]
+        ind_i = get_indicators(df_i, pair)
+        sig, _, _ = _smc_intraday_signal(pair, df_i, ind_i)
+
+        if not in_pos:
+            if sig == 0:
+                continue
+            in_pos = True
+            direction = int(sig)
+            entry = px
+            if direction == 1:
+                sl = entry - (float(sl_atr_mult) * a)
+                tp = entry + (float(tp_atr_mult) * a)
+                peak = entry
+            else:
+                sl = entry + (float(sl_atr_mult) * a)
+                tp = entry - (float(tp_atr_mult) * a)
+                peak = entry
+
+            trades.append({"direction": direction, "open_t": ts, "entry": entry, "sl": sl, "tp": tp, "close_t": None, "exit": None, "pnl": 0.0, "status": "OPEN", "exit_reason": None})
+            continue
+
+        if direction == 1:
+            if px > peak:
+                peak = px
+            if trailing_atr_mult is not None:
+                tsl = float(peak) - (float(trailing_atr_mult) * a)
+                if tsl > sl:
+                    sl = tsl
+        else:
+            if px < peak:
+                peak = px
+            if trailing_atr_mult is not None:
+                tsl = float(peak) + (float(trailing_atr_mult) * a)
+                if tsl < sl:
+                    sl = tsl
+
+        exit_now = False
+        exit_reason = None
+
+        if direction == 1:
+            if px <= sl:
+                exit_now = True
+                exit_reason = "SL"
+            elif px >= tp:
+                exit_now = True
+                exit_reason = "TP"
+            elif sig == -1:
+                exit_now = True
+                exit_reason = "REV"
+        else:
+            if px >= sl:
+                exit_now = True
+                exit_reason = "SL"
+            elif px <= tp:
+                exit_now = True
+                exit_reason = "TP"
+            elif sig == 1:
+                exit_now = True
+                exit_reason = "REV"
+
+        if exit_now:
+            risk = max(1e-9, float(equity) * (float(risk_pct) / 100.0))
+            if direction == 1:
+                sl_dist = max(entry - sl, 1e-9)
+                rr = (px - entry) / sl_dist
+            else:
+                sl_dist = max(sl - entry, 1e-9)
+                rr = (entry - px) / sl_dist
+
+            pnl = risk * rr
+            pnl = max(-risk, min(pnl, risk * (float(tp_atr_mult) / max(float(sl_atr_mult), 1e-9))))
+
+            fees = float(commission_bps) / 10000.0
+            if fees > 0:
+                pnl -= abs(pnl) * fees
+
+            equity += pnl
+
+            t = trades[-1]
+            t["close_t"] = ts
+            t["exit"] = px
+            t["pnl"] = float(pnl)
+            t["status"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+            t["exit_reason"] = exit_reason
+
+            in_pos = False
+            direction = 0
+            entry = 0.0
+            sl = 0.0
+            tp = 0.0
+            peak = 0.0
+
+    if eq and eq[-1]["t"] != df.index[-1]:
+        eq.append({"t": df.index[-1], "equity": float(equity)})
+
+    return {"equity": eq, "trades": trades}
+
+
 def _history_key(ticker, tf):
     return f"{ticker}|{tf}"
 
@@ -3238,9 +3587,27 @@ def apply_config_patch(patch):
 
     if "signal_mode" in patch:
         mode = str(patch["signal_mode"] or "").strip().upper()
-        if mode not in ["CLASSIC", "ELLIOTT"]:
-            raise ValueError("signal_mode must be CLASSIC or ELLIOTT")
+        if mode not in ["CLASSIC", "ELLIOTT", "SMC"]:
+            raise ValueError("signal_mode must be CLASSIC, ELLIOTT or SMC")
         out["signal_mode"] = mode
+
+    if "smc_pivot_period" in patch:
+        out["smc_pivot_period"] = int(float(patch["smc_pivot_period"]))
+        if out["smc_pivot_period"] < 1 or out["smc_pivot_period"] > 20:
+            raise ValueError("smc_pivot_period must be in [1, 20]")
+
+    if "smc_ob_lookback" in patch:
+        out["smc_ob_lookback"] = int(float(patch["smc_ob_lookback"]))
+        if out["smc_ob_lookback"] < 50 or out["smc_ob_lookback"] > 5000:
+            raise ValueError("smc_ob_lookback must be in [50, 5000]")
+
+    if "smc_use_fvg" in patch:
+        out["smc_use_fvg"] = to_bool(patch["smc_use_fvg"])
+
+    if "smc_fvg_min_atr" in patch:
+        out["smc_fvg_min_atr"] = float(patch["smc_fvg_min_atr"])
+        if out["smc_fvg_min_atr"] < 0 or out["smc_fvg_min_atr"] > 5:
+            raise ValueError("smc_fvg_min_atr must be in [0, 5]")
 
     if "elliott_zigzag_mult" in patch:
         out["elliott_zigzag_mult"] = float(patch["elliott_zigzag_mult"])
@@ -3713,7 +4080,18 @@ def backtest_cmd(m):
         tr = float(CONFIG.get("trailing_stop_atr_multiplier", 1.5)) if tr_on else None
         fee = float(CONFIG.get("backtest_commission_bps", 0.0) or 0.0)
 
-    if strat in ["ELLIOTT", "ELLIOTT_TRIANGLE", "WAVES"]:
+    if strat in ["SMC", "OB", "FVG"]:
+        bt = backtest_smc(
+            df,
+            pair=pair,
+            sl_atr_mult=sl,
+            tp_atr_mult=tp,
+            trailing_atr_mult=tr,
+            commission_bps=fee,
+            initial_equity=float(CONFIG.get("initial_balance", 10000.0) or 10000.0),
+            risk_pct=float(CONFIG.get("risk_per_trade", 10.0) or 10.0),
+        )
+    elif strat in ["ELLIOTT", "ELLIOTT_TRIANGLE", "WAVES"]:
         bt = backtest_elliott_triangle(
             df,
             pair=pair,

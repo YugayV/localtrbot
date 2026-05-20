@@ -265,8 +265,20 @@ with col_right:
             max_total_positions = st.number_input("Max total positions", min_value=0, max_value=50, value=int(cfg.get("max_total_positions", 10)), step=1)
             goya_score_enabled = st.selectbox("VitalityScore", ["true", "false"], index=0 if bool(cfg.get("goya_score_enabled", True)) else 1)
             goya_min_score = st.number_input("Vitality min score", min_value=0, max_value=100, value=int(cfg.get("goya_min_score", 35)), step=1)
+            deepseek_enabled = st.selectbox("DeepSeek (AI фильтр)", ["false", "true"], index=1 if bool(cfg.get("deepseek_enabled", False)) else 0)
 
-            signal_mode = st.selectbox("Signal mode", ["ELLIOTT", "CLASSIC"], index=0 if str(cfg.get("signal_mode", "ELLIOTT") or "ELLIOTT").upper().strip() == "ELLIOTT" else 1)
+            sm = str(cfg.get("signal_mode", "SMC") or "SMC").upper().strip()
+            signal_mode = st.selectbox(
+                "Signal mode",
+                ["SMC", "ELLIOTT", "CLASSIC"],
+                index=0 if sm == "SMC" else (1 if sm == "ELLIOTT" else 2),
+            )
+
+            smc_pivot_period = st.number_input("SMC pivot period", min_value=1, max_value=20, value=int(cfg.get("smc_pivot_period", 5) or 5), step=1)
+            smc_ob_lookback = st.number_input("SMC lookback bars", min_value=50, max_value=5000, value=int(cfg.get("smc_ob_lookback", 280) or 280), step=10)
+            smc_use_fvg = st.selectbox("SMC use FVG", ["true", "false"], index=0 if bool(cfg.get("smc_use_fvg", True)) else 1)
+            smc_fvg_min_atr = st.number_input("SMC FVG min ATR x", min_value=0.0, max_value=5.0, value=float(cfg.get("smc_fvg_min_atr", 0.2) or 0.2), step=0.05)
+
             elliott_zigzag_mult = st.number_input("Elliott zigzag x", min_value=0.1, max_value=10.0, value=float(cfg.get("elliott_zigzag_mult", 1.0) or 1.0), step=0.05)
             elliott_corr_mult = st.number_input("Elliott corr x", min_value=0.1, max_value=2.0, value=float(cfg.get("elliott_corr_mult", 0.55) or 0.55), step=0.05)
             elliott_triangle_break_atr = st.number_input("Elliott break ATR x", min_value=0.0, max_value=5.0, value=float(cfg.get("elliott_triangle_break_atr", 0.20) or 0.20), step=0.05)
@@ -296,6 +308,10 @@ with col_right:
                     "backtest_commission_bps": backtest_commission_bps,
                     "trade_commission_bps": trade_commission_bps,
                     "signal_mode": signal_mode,
+                    "smc_pivot_period": smc_pivot_period,
+                    "smc_ob_lookback": smc_ob_lookback,
+                    "smc_use_fvg": smc_use_fvg,
+                    "smc_fvg_min_atr": smc_fvg_min_atr,
                     "elliott_zigzag_mult": elliott_zigzag_mult,
                     "elliott_corr_mult": elliott_corr_mult,
                     "elliott_triangle_break_atr": elliott_triangle_break_atr,
@@ -304,6 +320,7 @@ with col_right:
                     "elliott_require_golden": elliott_require_golden,
                     "goya_score_enabled": goya_score_enabled,
                     "goya_min_score": goya_min_score,
+                    "deepseek_enabled": deepseek_enabled,
                 }
             )
             st.success("Сохранено")
@@ -428,10 +445,27 @@ with col_left:
         except Exception as e:
             st.error(f"Wave analysis error: {e}")
 
+    smc_show = False
+    smc_data = None
+    with st.expander("SMC (Order Blocks + FVG)", expanded=False):
+        smc_show = st.checkbox("Показывать на графике (SMC)", value=True)
+        try:
+            if hasattr(botmod, "smc_overlay"):
+                smc_data = botmod.smc_overlay(df.tail(1600), pair)
+                if isinstance(smc_data, dict) and smc_data.get("ok"):
+                    st.caption(f"SMC dir: {smc_data.get('dir')} | OB: {len(smc_data.get('obs') or [])} | FVG: {len(smc_data.get('fvgs') or [])}")
+                    ev = (smc_data.get("events") or [])
+                    if ev:
+                        st.caption(f"Last event: {ev[-1].get('kind')} dir={ev[-1].get('dir')}")
+            else:
+                st.info("SMC overlay not available in bot module")
+        except Exception as e:
+            st.error(f"SMC error: {e}")
+
     with st.expander("Бэктест и оптимизация", expanded=False):
         st.caption("Идея из статьи: быстро проверить стратегию на истории, затем перебрать варианты и сравнить метрики (Sortino/MaxDD/PF).")
 
-        strat = st.selectbox("Стратегия", ["Elliott+Fibo (Wave4 triangle)", "MACD+RSI (моментум)", "Bollinger (mean-reversion)"], index=0)
+        strat = st.selectbox("Стратегия", ["SMC (OB+FVG)", "Elliott+Fibo (Wave4 triangle)", "MACD+RSI (моментум)", "Bollinger (mean-reversion)"], index=0)
 
         fee_bps = float((cfg or {}).get("backtest_commission_bps", 0.0) or 0.0)
         st.caption(f"Комиссия (bps): {fee_bps}")
@@ -488,7 +522,23 @@ with col_left:
 
         if run_bt:
             try:
-                if strat.startswith("Elliott"):
+                if strat.startswith("SMC"):
+                    if tf != "15m":
+                        st.warning("Для SMC рекомендуется 15m (интрадей).")
+                    if not hasattr(botmod, "backtest_smc"):
+                        raise RuntimeError("backtest_smc is not available in bot module")
+                    bt = botmod.backtest_smc(
+                        df,
+                        pair=str(pair),
+                        sl_atr_mult=sl,
+                        tp_atr_mult=tp,
+                        trailing_atr_mult=tr,
+                        commission_bps=float(fee_bps),
+                        initial_equity=float(bt_start),
+                        risk_pct=float(bt_risk_pct),
+                    )
+                    params = {"strategy": "SMC", "sl_atr": float(sl), "tp_atr": float(tp), "trail_atr": tr}
+                elif strat.startswith("Elliott"):
                     if tf != "15m":
                         st.warning("Для Elliott+Fibo рекомендуется 15m (интрадей).")
                     bt = botmod.backtest_elliott_triangle(
@@ -657,6 +707,66 @@ with col_left:
                     yaxis="y2",
                 )
             )
+
+        if smc_show and isinstance(smc_data, dict) and smc_data.get("ok"):
+            try:
+                def _to_dt(x):
+                    if x is None:
+                        return None
+                    if isinstance(x, (int, float)):
+                        return pd.to_datetime(int(x), unit="s", utc=True)
+                    try:
+                        return pd.to_datetime(x, utc=True)
+                    except Exception:
+                        return None
+
+                for ob in (smc_data.get("obs") or [])[:80]:
+                    x0 = _to_dt(ob.get("t0") or ob.get("start") or ob.get("time0") or ob.get("x0"))
+                    x1 = _to_dt(ob.get("t1") or ob.get("end") or ob.get("time1") or ob.get("x1"))
+                    y0 = ob.get("low") if ob.get("low") is not None else ob.get("y0")
+                    y1 = ob.get("high") if ob.get("high") is not None else ob.get("y1")
+                    if x0 is None or x1 is None or y0 is None or y1 is None:
+                        continue
+                    d = int(ob.get("dir") or 0)
+                    col = "rgba(34,197,94,0.18)" if d >= 0 else "rgba(239,68,68,0.18)"
+                    line_col = "rgba(34,197,94,0.50)" if d >= 0 else "rgba(239,68,68,0.50)"
+                    fig.add_shape(
+                        type="rect",
+                        xref="x",
+                        yref="y",
+                        x0=x0,
+                        x1=x1,
+                        y0=float(min(y0, y1)),
+                        y1=float(max(y0, y1)),
+                        fillcolor=col,
+                        line=dict(color=line_col, width=1),
+                        layer="below",
+                    )
+
+                for fvg in (smc_data.get("fvgs") or [])[:120]:
+                    x0 = _to_dt(fvg.get("t0") or fvg.get("start") or fvg.get("time0") or fvg.get("x0"))
+                    x1 = _to_dt(fvg.get("t1") or fvg.get("end") or fvg.get("time1") or fvg.get("x1"))
+                    y0 = fvg.get("low") if fvg.get("low") is not None else fvg.get("y0")
+                    y1 = fvg.get("high") if fvg.get("high") is not None else fvg.get("y1")
+                    if x0 is None or x1 is None or y0 is None or y1 is None:
+                        continue
+                    d = int(fvg.get("dir") or 0)
+                    col = "rgba(59,130,246,0.14)" if d >= 0 else "rgba(245,158,11,0.14)"
+                    line_col = "rgba(59,130,246,0.45)" if d >= 0 else "rgba(245,158,11,0.45)"
+                    fig.add_shape(
+                        type="rect",
+                        xref="x",
+                        yref="y",
+                        x0=x0,
+                        x1=x1,
+                        y0=float(min(y0, y1)),
+                        y1=float(max(y0, y1)),
+                        fillcolor=col,
+                        line=dict(color=line_col, width=1, dash="dot"),
+                        layer="below",
+                    )
+            except Exception:
+                pass
 
         if wave_show and wave_swings:
             xs = []
