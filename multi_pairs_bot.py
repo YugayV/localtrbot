@@ -76,7 +76,7 @@ CONFIG_DEFAULTS = {
     "daily_loss_limit_pct": 0.0,
     "close_positions_on_stop": False,
 
-    "signal_mode": "SMC",
+    "signal_mode": "CLASSIC",
 
     "smc_pivot_period": 5,
     "smc_ob_lookback": 280,
@@ -90,8 +90,8 @@ CONFIG_DEFAULTS = {
     "elliott_fib_max": 0.618,
     "elliott_require_golden": False,
 
-    "goya_score_enabled": True,
-    "goya_min_score": 20,
+    "goya_score_enabled": False,
+    "goya_min_score": 0,
     "goya_rank_candidates": True,
     "deepseek_enabled": False,
     "deepseek_model": "deepseek-v4-flash",
@@ -1697,11 +1697,21 @@ def check_signal(ind, enforce_hours=True):
     sma = ind['sma']
     change = ind['change']
 
-    proxy = change
+    proxy = float(change)
 
-    if proxy < -0.02 and rsi < 45:
+    pair = str(ind.get("pair") or "")
+    is_crypto = pair in CRYPTO_PAIRS
+
+    atr = float(ind.get("atr") or 0.0)
+    atrp = abs(float(atr) / float(price)) if float(price) != 0 else 0.0
+
+    base = 0.003 if is_crypto else (0.0008 if pair.endswith("JPY") else 0.0006)
+    weak_move = max(float(base), float(atrp) * 0.55)
+    strong_move = float(weak_move) * 1.7
+
+    if proxy < -weak_move and rsi < 45:
         signals.append("Proxy DOWN + RSI")
-    if proxy > 0.02 and rsi > 55:
+    if proxy > weak_move and rsi > 55:
         signals.append("Proxy UP + RSI")
     if rsi < 35:
         signals.append("RSI Oversold")
@@ -1711,9 +1721,9 @@ def check_signal(ind, enforce_hours=True):
         signals.append("Trend Up")
     if trend == -1 and price > sma * 0.998:
         signals.append("Trend Down")
-    if proxy < -0.03:
+    if proxy < -strong_move:
         signals.append("Strong Down")
-    if proxy > 0.03:
+    if proxy > strong_move:
         signals.append("Strong Up")
 
     if enforce_hours and get_seoul_time().hour not in GOOD_HOURS:
@@ -1752,23 +1762,6 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
 
     ind15 = get_indicators(d15, pair)
     ind1h = get_indicators(d1h, pair)
-
-    with config_lock:
-        mode = str(CONFIG.get("signal_mode", "SMC") or "SMC").upper().strip()
-
-    if mode == "SMC":
-        sig15, reasons, _ = _smc_intraday_signal(pair, d15, ind15)
-        reasons = list(reasons or [])
-        reasons.append("Mode: SMC")
-        return sig15, reasons, ind15, ind1h
-
-    if mode == "ELLIOTT":
-        sig15, reasons, imp = _elliott_wave4_triangle_signal(pair, d15, ind15, enforce_hours=enforce_hours)
-        reasons = list(reasons or [])
-        if imp is not None and imp.get("direction") is not None:
-            reasons.append(f"Impulse dir: {imp.get('direction')}")
-        reasons.append("Mode: ELLIOTT")
-        return sig15, reasons, ind15, ind1h
 
     sig15, reasons = check_signal(ind15, enforce_hours=enforce_hours)
 
