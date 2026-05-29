@@ -8,6 +8,7 @@ Notifications: Trade alerts + Hourly reports
 import telebot
 from telebot import types
 from telebot.apihelper import ApiTelegramException
+import telebot.apihelper as apihelper
 import logging
 import yfinance as yf
 import pandas as pd
@@ -55,6 +56,16 @@ TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
 if not BOT_TOKEN or not ADMIN_ID:
     raise RuntimeError("Missing BOT_TOKEN or ADMIN_ID in .env")
+
+TELEGRAM_CONNECT_TIMEOUT = float(os.environ.get("TELEGRAM_CONNECT_TIMEOUT", "10") or 10)
+TELEGRAM_READ_TIMEOUT = float(os.environ.get("TELEGRAM_READ_TIMEOUT", "60") or 60)
+TELEGRAM_LONG_POLL_TIMEOUT = float(os.environ.get("TELEGRAM_LONG_POLL_TIMEOUT", "60") or 60)
+
+try:
+    apihelper.CONNECT_TIMEOUT = TELEGRAM_CONNECT_TIMEOUT
+    apihelper.READ_TIMEOUT = TELEGRAM_READ_TIMEOUT
+except Exception:
+    pass
 
 CONFIG_FILE = os.path.join(BASE_DIR, "bot_config.json")
 config_lock = threading.Lock()
@@ -4663,7 +4674,15 @@ def run_bot_polling():
     backoff = 5
     while True:
         try:
-            bot.polling(none_stop=True)
+            try:
+                bot.polling(
+                    none_stop=True,
+                    interval=0,
+                    timeout=int(TELEGRAM_LONG_POLL_TIMEOUT),
+                    long_polling_timeout=int(TELEGRAM_LONG_POLL_TIMEOUT),
+                )
+            except TypeError:
+                bot.polling(none_stop=True)
             backoff = 5
         except ApiTelegramException as e:
             RUNTIME["bot_poll_last_error"] = str(e)
@@ -4676,6 +4695,11 @@ def run_bot_polling():
             backoff = min(backoff * 2, 300)
         except Exception as e:
             RUNTIME["bot_poll_last_error"] = str(e)
+            msg = str(e)
+            if "Read timed out" in msg or "timed out" in msg:
+                print(f"Polling timeout: {e}", flush=True)
+                time.sleep(2)
+                continue
             print(f"Polling error: {e}", flush=True)
             time.sleep(backoff)
             backoff = min(backoff * 2, 300)
