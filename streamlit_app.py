@@ -263,31 +263,22 @@ with col_right:
         with cset1:
             trades_per_pair = st.number_input("Trades per pair", min_value=0, max_value=20, value=int(cfg["trades_per_pair"]), step=1)
             max_total_positions = st.number_input("Max total positions", min_value=0, max_value=50, value=int(cfg.get("max_total_positions", 10)), step=1)
-            goya_score_enabled = st.selectbox("VitalityScore", ["true", "false"], index=0 if bool(cfg.get("goya_score_enabled", True)) else 1)
-            goya_min_score = st.number_input("Vitality min score", min_value=0, max_value=100, value=int(cfg.get("goya_min_score", 35)), step=1)
-            deepseek_enabled = st.selectbox("DeepSeek (AI фильтр)", ["false", "true"], index=1 if bool(cfg.get("deepseek_enabled", False)) else 0)
-
-            sm = str(cfg.get("signal_mode", "SMC") or "SMC").upper().strip()
+            sm = str(cfg.get("signal_mode", "HYBRID") or "HYBRID").upper().strip()
             signal_mode = st.selectbox(
                 "Signal mode",
-                ["SMC", "ELLIOTT", "CLASSIC"],
-                index=0 if sm == "SMC" else (1 if sm == "ELLIOTT" else 2),
+                ["HYBRID", "CLASSIC", "SMC"],
+                index=0 if sm == "HYBRID" else (1 if sm == "CLASSIC" else 2),
             )
+
+            hybrid_require_structure = st.selectbox("Hybrid: require structure", ["true", "false"], index=0 if bool(cfg.get("hybrid_require_structure", True)) else 1)
+            hybrid_require_zone = st.selectbox("Hybrid: require zone", ["true", "false"], index=0 if bool(cfg.get("hybrid_require_zone", True)) else 1)
+            hybrid_zone_atr = st.number_input("Hybrid: zone distance (ATR x)", min_value=0.0, max_value=10.0, value=float(cfg.get("hybrid_zone_atr", 1.0) or 1.0), step=0.1)
+            hybrid_allow_fvg = st.selectbox("Hybrid: allow FVG", ["true", "false"], index=0 if bool(cfg.get("hybrid_allow_fvg", True)) else 1)
 
             smc_pivot_period = st.number_input("SMC pivot period", min_value=1, max_value=20, value=int(cfg.get("smc_pivot_period", 5) or 5), step=1)
             smc_ob_lookback = st.number_input("SMC lookback bars", min_value=50, max_value=5000, value=int(cfg.get("smc_ob_lookback", 280) or 280), step=10)
             smc_use_fvg = st.selectbox("SMC use FVG", ["true", "false"], index=0 if bool(cfg.get("smc_use_fvg", True)) else 1)
             smc_fvg_min_atr = st.number_input("SMC FVG min ATR x", min_value=0.0, max_value=5.0, value=float(cfg.get("smc_fvg_min_atr", 0.2) or 0.2), step=0.05)
-
-            elliott_zigzag_mult = st.number_input("Elliott zigzag x", min_value=0.1, max_value=10.0, value=float(cfg.get("elliott_zigzag_mult", 1.0) or 1.0), step=0.05)
-            elliott_corr_mult = st.number_input("Elliott corr x", min_value=0.1, max_value=2.0, value=float(cfg.get("elliott_corr_mult", 0.55) or 0.55), step=0.05)
-            elliott_triangle_break_atr = st.number_input("Elliott break ATR x", min_value=0.0, max_value=5.0, value=float(cfg.get("elliott_triangle_break_atr", 0.20) or 0.20), step=0.05)
-            elliott_fib_min = st.number_input("Elliott fib min", min_value=0.0, max_value=2.0, value=float(cfg.get("elliott_fib_min", 0.382) or 0.382), step=0.01)
-            elliott_fib_max = st.number_input("Elliott fib max", min_value=0.0, max_value=2.0, value=float(cfg.get("elliott_fib_max", 0.618) or 0.618), step=0.01)
-            elliott_require_golden = st.selectbox("Require golden (0.618)", ["false", "true"], index=1 if bool(cfg.get("elliott_require_golden", False)) else 0)
-
-            show_ai_indicators = st.selectbox("Показывать AI индикаторы", ["false", "true"], index=1 if bool(st.session_state.get("show_ai_indicators", False)) else 0)
-            st.session_state["show_ai_indicators"] = (show_ai_indicators == "true")
         with cset2:
             sl_atr_multiplier = st.number_input("SL (ATR x)", min_value=0.1, max_value=20.0, value=float(cfg.get("sl_atr_multiplier", 2.0)), step=0.1)
             tp_atr_multiplier = st.number_input("TP (ATR x)", min_value=0.1, max_value=50.0, value=float(cfg.get("tp_atr_multiplier", 6.0)), step=0.1)
@@ -308,19 +299,14 @@ with col_right:
                     "backtest_commission_bps": backtest_commission_bps,
                     "trade_commission_bps": trade_commission_bps,
                     "signal_mode": signal_mode,
+                    "hybrid_require_structure": hybrid_require_structure,
+                    "hybrid_require_zone": hybrid_require_zone,
+                    "hybrid_zone_atr": hybrid_zone_atr,
+                    "hybrid_allow_fvg": hybrid_allow_fvg,
                     "smc_pivot_period": smc_pivot_period,
                     "smc_ob_lookback": smc_ob_lookback,
                     "smc_use_fvg": smc_use_fvg,
                     "smc_fvg_min_atr": smc_fvg_min_atr,
-                    "elliott_zigzag_mult": elliott_zigzag_mult,
-                    "elliott_corr_mult": elliott_corr_mult,
-                    "elliott_triangle_break_atr": elliott_triangle_break_atr,
-                    "elliott_fib_min": elliott_fib_min,
-                    "elliott_fib_max": elliott_fib_max,
-                    "elliott_require_golden": elliott_require_golden,
-                    "goya_score_enabled": goya_score_enabled,
-                    "goya_min_score": goya_min_score,
-                    "deepseek_enabled": deepseek_enabled,
                 }
             )
             st.success("Сохранено")

@@ -52,7 +52,6 @@ _LOG_LOCK = threading.Lock()
 
 WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 
 if not BOT_TOKEN or not ADMIN_ID:
     raise RuntimeError("Missing BOT_TOKEN or ADMIN_ID in .env")
@@ -76,29 +75,21 @@ CONFIG_DEFAULTS = {
     "daily_loss_limit_pct": 0.0,
     "close_positions_on_stop": False,
 
-    "signal_mode": "CLASSIC",
+    "signal_mode": "HYBRID",
+
+    "hybrid_require_structure": True,
+    "hybrid_require_zone": True,
+    "hybrid_zone_atr": 1.0,
+    "hybrid_allow_fvg": True,
 
     "smc_pivot_period": 5,
     "smc_ob_lookback": 280,
     "smc_use_fvg": True,
     "smc_fvg_min_atr": 0.2,
 
-    "elliott_zigzag_mult": 1.0,
-    "elliott_corr_mult": 0.55,
-    "elliott_triangle_break_atr": 0.20,
-    "elliott_fib_min": 0.382,
-    "elliott_fib_max": 0.618,
-    "elliott_require_golden": False,
-
     "goya_score_enabled": False,
     "goya_min_score": 0,
     "goya_rank_candidates": True,
-    "deepseek_enabled": False,
-    "deepseek_model": "deepseek-v4-flash",
-    "deepseek_timeout_sec": 10,
-    "deepseek_ttl_sec": 300,
-    "deepseek_min_local_score": 45,
-    "deepseek_min_confidence": 0.6,
 
     "imbalance_enabled": True,
     "imbalance_lookback": 220,
@@ -1357,6 +1348,171 @@ def backtest_bbands_meanrev(df: pd.DataFrame, bb_period: int = 20, bb_mult: floa
 
 
 
+def backtest_classic_proxy(df: pd.DataFrame, pair: str = "EURUSD", sl_atr_mult: float = 2.0, tp_atr_mult: float = 6.0, trailing_atr_mult: float | None = None, commission_bps: float = 0.0, initial_equity: float = 100.0, risk_pct: float = 10.0):
+    df = df.copy()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if df.empty or len(df) < 120:
+        return {"equity": [], "trades": [], "error": "not enough data"}
+
+    close = df["Close"].astype(float)
+    sma20 = close.rolling(20).mean()
+    rsi = _rsi_series(close, 14)
+    atr = _atr(df, 14)
+    change = close.pct_change().fillna(0.0)
+
+    equity = float(initial_equity) if float(initial_equity) > 0 else 100.0
+    eq = []
+    trades = []
+
+    in_pos = False
+    direction = 0
+    entry = 0.0
+    sl = 0.0
+    tp = 0.0
+    peak = 0.0
+
+    is_crypto = pair in CRYPTO_PAIRS
+    base = 0.003 if is_crypto else (0.0008 if str(pair).endswith("JPY") else 0.0006)
+
+    for i in range(30, len(df)):
+        ts = df.index[i]
+        px = float(close.iloc[i])
+        eq.append({"t": ts, "equity": float(equity)})
+
+        a = float(atr.iloc[i] or 0.0)
+        if a <= 0 or px <= 0:
+            continue
+
+        atrp = abs(a / px)
+        weak_move = max(float(base), float(atrp) * 0.55)
+        strong_move = float(weak_move) * 1.7
+
+        c = float(change.iloc[i])
+        r = float(rsi.iloc[i] or 50.0)
+        t15 = 1 if px > float(sma20.iloc[i] or px) else -1
+
+        buy = 0
+        sell = 0
+
+        if c < -weak_move and r < 45:
+            buy += 1
+        if c > weak_move and r > 55:
+            sell += 1
+        if r < 35:
+            buy += 1
+        if r > 65:
+            sell += 1
+        if t15 == 1 and px < float(sma20.iloc[i] or px) * 1.002:
+            buy += 1
+        if t15 == -1 and px > float(sma20.iloc[i] or px) * 0.998:
+            sell += 1
+        if c < -strong_move:
+            buy += 1
+        if c > strong_move:
+            sell += 1
+
+        sig = 0
+        if buy >= 2 and buy > sell:
+            sig = 1
+        elif sell >= 2 and sell > buy:
+            sig = -1
+
+        if not in_pos:
+            if sig == 0:
+                continue
+
+            in_pos = True
+            direction = int(sig)
+            entry = px
+            if direction == 1:
+                sl = entry - (float(sl_atr_mult) * a)
+                tp = entry + (float(tp_atr_mult) * a)
+                peak = entry
+            else:
+                sl = entry + (float(sl_atr_mult) * a)
+                tp = entry - (float(tp_atr_mult) * a)
+                peak = entry
+
+            trades.append({"direction": direction, "open_t": ts, "entry": entry, "sl": sl, "tp": tp, "close_t": None, "exit": None, "pnl": 0.0, "status": "OPEN", "exit_reason": None})
+            continue
+
+        if direction == 1:
+            if px > peak:
+                peak = px
+            if trailing_atr_mult is not None:
+                tsl = float(peak) - (float(trailing_atr_mult) * a)
+                if tsl > sl:
+                    sl = tsl
+        else:
+            if px < peak:
+                peak = px
+            if trailing_atr_mult is not None:
+                tsl = float(peak) + (float(trailing_atr_mult) * a)
+                if tsl < sl:
+                    sl = tsl
+
+        exit_now = False
+        exit_reason = None
+        if direction == 1:
+            if px <= sl:
+                exit_now = True
+                exit_reason = "SL"
+            elif px >= tp:
+                exit_now = True
+                exit_reason = "TP"
+            elif sig == -1:
+                exit_now = True
+                exit_reason = "REV"
+        else:
+            if px >= sl:
+                exit_now = True
+                exit_reason = "SL"
+            elif px <= tp:
+                exit_now = True
+                exit_reason = "TP"
+            elif sig == 1:
+                exit_now = True
+                exit_reason = "REV"
+
+        if exit_now:
+            risk = max(1e-9, float(equity) * (float(risk_pct) / 100.0))
+            if direction == 1:
+                sl_dist = max(entry - sl, 1e-9)
+                rr = (px - entry) / sl_dist
+            else:
+                sl_dist = max(sl - entry, 1e-9)
+                rr = (entry - px) / sl_dist
+
+            pnl = risk * rr
+            pnl = max(-risk, min(pnl, risk * (float(tp_atr_mult) / max(float(sl_atr_mult), 1e-9))))
+
+            fees = float(commission_bps) / 10000.0
+            if fees > 0:
+                pnl -= abs(pnl) * fees
+
+            equity += pnl
+
+            t = trades[-1]
+            t["close_t"] = ts
+            t["exit"] = px
+            t["pnl"] = float(pnl)
+            t["status"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+            t["exit_reason"] = exit_reason
+
+            in_pos = False
+            direction = 0
+            entry = 0.0
+            sl = 0.0
+            tp = 0.0
+            peak = 0.0
+
+    if eq and eq[-1]["t"] != df.index[-1]:
+        eq.append({"t": df.index[-1], "equity": float(equity)})
+
+    return {"equity": eq, "trades": trades}
+
+
+
 def backtest_elliott_triangle(df: pd.DataFrame, pair: str = "EURUSD", sl_atr_mult: float = 2.0, tp_atr_mult: float = 6.0, trailing_atr_mult: float | None = None, commission_bps: float = 0.0, initial_equity: float = 100.0, risk_pct: float = 10.0):
     df = df.copy()
     df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
@@ -1763,134 +1919,93 @@ def get_intraday_signal(pair, ticker, enforce_hours=True):
     ind15 = get_indicators(d15, pair)
     ind1h = get_indicators(d1h, pair)
 
-    sig15, reasons = check_signal(ind15, enforce_hours=enforce_hours)
+    with config_lock:
+        mode = str(CONFIG.get("signal_mode", "HYBRID") or "HYBRID").upper().strip()
+        req_struct = bool(CONFIG.get("hybrid_require_structure", True))
+        req_zone = bool(CONFIG.get("hybrid_require_zone", True))
+        zone_atr = float(CONFIG.get("hybrid_zone_atr", 1.0) or 1.0)
+        allow_fvg = bool(CONFIG.get("hybrid_allow_fvg", True))
 
-    sig = sig15
+    sig, reasons = check_signal(ind15, enforce_hours=enforce_hours)
+    reasons = list(reasons or [])
 
-    reasons = list(reasons)
-    reasons.append(f"TF 15m RSI:{ind15['rsi']:.0f} Trend:{'UP' if ind15['trend']==1 else 'DOWN'}")
-    reasons.append(f"Confirm 1h RSI:{ind1h['rsi']:.0f} Trend:{'UP' if ind1h['trend']==1 else 'DOWN'}")
-
-    if pair not in CRYPTO_PAIRS:
-        if sig15 == 1 and ind15['trend'] != 1:
-            reasons.append("Filter: 15m trend not UP")
-            sig = 0
-        if sig15 == -1 and ind15['trend'] != -1:
-            reasons.append("Filter: 15m trend not DOWN")
-            sig = 0
-
-        if sig15 == 1 and ind1h['trend'] != 1:
-            reasons.append("Filter: 1h trend not UP")
-            sig = 0
-        if sig15 == -1 and ind1h['trend'] != -1:
-            reasons.append("Filter: 1h trend not DOWN")
-            sig = 0
-    else:
-        reasons.append("Crypto mode: trend filters disabled")
-
-    if pair not in CRYPTO_PAIRS:
-        if pair == "EURUSD":
-            try:
-                macro = _dxy_confirmation_for_eurusd(ind15, interval="15m")
-                if macro is not None:
-                    reasons.append(
-                        f"DXY({macro['interval']}): {macro['dxy']:.2f} ret={macro['ret']*100:+.2f}% mom3={macro['mom3']*100:+.2f}% rsi={macro['rsi']:.0f} score={macro['score']}"
-                    )
-                    for d in (macro.get("details") or [])[:4]:
-                        reasons.append(f"DXY confirm: {d}")
-
-                    if sig != 0 and int(macro.get("dir") or 0) != 0 and int(macro.get("dir") or 0) != int(sig):
-                        reasons.append("Filter: DXY disagrees")
-                        sig = 0
-            except Exception:
-                pass
-
-        if sig15 == 1 and float(ind1h.get('rsi', 50) or 50) < 48:
-            reasons.append("Filter: 1h RSI < 48")
-            sig = 0
-        if sig15 == -1 and float(ind1h.get('rsi', 50) or 50) > 52:
-            reasons.append("Filter: 1h RSI > 52")
-            sig = 0
-
-        try:
-            lookback = 10
-            if len(d15) > lookback + 2:
-                prev_high = float(d15['High'].iloc[-(lookback + 1):-1].max())
-                prev_low = float(d15['Low'].iloc[-(lookback + 1):-1].min())
-
-                strong_up = any("Strong Up" in s or "Proxy UP" in s for s in reasons)
-                strong_dn = any("Strong Down" in s or "Proxy DOWN" in s for s in reasons)
-
-                if sig15 == 1 and float(ind15.get('price')) < prev_high and not strong_up:
-                    reasons.append("Filter: no 10-bar breakout")
-                    sig = 0
-                if sig15 == -1 and float(ind15.get('price')) > prev_low and not strong_dn:
-                    reasons.append("Filter: no 10-bar breakdown")
-                    sig = 0
-        except Exception:
-            pass
-    else:
-        reasons.append("Crypto mode: relaxed filters (no 1h RSI / no breakout)")
-
-    p_up = None
-    try:
-        model = load_direction_model(pair, tf="15m")
-        if model is not None:
-            p_up = predict_direction_proba(d15, model)
-            if p_up is not None:
-                reasons.append(f"Model p(up)={p_up:.2f} acc={float((model.get('metrics') or {}).get('acc') or 0):.2f}")
-                if sig == 1 and p_up < 0.52:
-                    reasons.append("Filter: model p(up) < 0.52")
-                    sig = 0
-                if sig == -1 and p_up > 0.48:
-                    reasons.append("Filter: model p(up) > 0.48")
-                    sig = 0
-    except Exception:
-        pass
-
-    try:
-        gs = _goya_score_local(pair, d15, ind15, ind1h, p_up=p_up)
-        sc = int(gs.get("score") or 0) if gs else 0
-        ind15["goya_score"] = sc
-        v20 = gs.get("vol20") if gs else None
-        if v20 is not None:
-            reasons.append(f"VitalityScore: {sc:+d} vol20={float(v20)*100:.2f}%")
-        else:
-            reasons.append(f"VitalityScore: {sc:+d}")
-
-        with config_lock:
-            goya_on = bool(CONFIG.get("goya_score_enabled", True))
-            min_sc = int(CONFIG.get("goya_min_score", 35) or 0)
-
-        if goya_on and (pair in CRYPTO_PAIRS or pair == "EURUSD"):
-            if abs(sc) < int(min_sc):
-                if sig != 0:
-                    reasons.append(f"Filter: goya_score abs<{int(min_sc)}")
+    if mode == "SMC":
+        sig, reasons, _ = _smc_intraday_signal(pair, d15, ind15)
+        reasons = list(reasons or [])
+        if int(sig) != 0:
+            px = float(ind15.get("price") or 0.0)
+            atr = float(ind15.get("atr") or 0.0)
+            with config_lock:
+                pp = int(CONFIG.get("smc_pivot_period", 5) or 5)
+            best = _snr_best_level(d15.tail(600), atr=atr, pp=pp, direction=int(sig), price=px, dist_atr_mult=zone_atr, max_levels=10)
+            if best is None:
+                reasons.append("Filter: no SNR level")
                 sig = 0
             else:
-                dir_sc = 1 if sc > 0 else -1
-                if sig != 0 and dir_sc != int(sig):
-                    reasons.append("Filter: goya_score disagrees")
+                lv = best.get("level") or {}
+                reasons.append(f"SNR {lv.get('kind')} {float(lv.get('price') or 0.0):.5f} d={float(best.get('dist') or 0.0):.5f}")
+
+    if mode == "HYBRID" and int(sig) != 0:
+        overlay = smc_overlay(d15.tail(600), pair)
+        if not bool(overlay.get("ok")):
+            reasons.append("SMC: overlay unavailable")
+        else:
+            struct_dir = int(overlay.get("dir") or 0)
+            obs = overlay.get("obs") or []
+            fvgs = overlay.get("fvgs") or []
+            reasons.append(f"SMC dir={struct_dir} OB={len(obs)} FVG={len(fvgs)}")
+
+            if req_struct and struct_dir not in [0, int(sig)]:
+                reasons.append("Filter: SMC structure disagrees")
+                sig = 0
+
+            if int(sig) != 0 and req_zone:
+                best = None
+                for z in reversed(obs):
+                    if int(z.get("dir") or 0) == int(sig):
+                        best = z
+                        break
+
+                if best is None and allow_fvg:
+                    for z in reversed(fvgs):
+                        if int(z.get("dir") or 0) == int(sig):
+                            best = z
+                            break
+
+                if best is None:
+                    reasons.append("Filter: no SMC zone")
                     sig = 0
+                else:
+                    px = float(ind15.get("price") or 0.0)
+                    atr = float(ind15.get("atr") or 0.0)
+                    z_low = float(best.get("low") or 0.0)
+                    z_high = float(best.get("high") or 0.0)
+                    in_zone = (z_low <= px <= z_high)
+                    dist = min(abs(px - z_low), abs(px - z_high))
+                    ok = in_zone or (atr > 0 and dist <= float(atr) * float(zone_atr))
+                    reasons.append(f"Zone {z_low:.5f}-{z_high:.5f} {'IN' if in_zone else f'd={dist:.5f}'}")
+                    if not ok:
+                        reasons.append("Filter: too far from zone")
+                        sig = 0
 
-        ds = _deepseek_goya_score(pair, "15m", ind15, ind1h, local_score=sc)
-        if ds is not None:
-            reasons.append(f"DeepSeekScore: {int(ds.get('score') or 0):+d} conf={float(ds.get('confidence') or 0):.2f}")
-            for r in (ds.get("reasons") or [])[:4]:
-                reasons.append(f"DeepSeek: {r}")
-
-            with config_lock:
-                min_conf = float(CONFIG.get("deepseek_min_confidence", 0.6) or 0.6)
-
-            if sig != 0 and float(ds.get("confidence") or 0) >= float(min_conf):
-                ddir = int(ds.get("dir") or 0)
-                if ddir != 0 and ddir != int(sig):
-                    reasons.append("Filter: deepseek disagrees")
+            if int(sig) != 0:
+                px = float(ind15.get("price") or 0.0)
+                atr = float(ind15.get("atr") or 0.0)
+                with config_lock:
+                    pp = int(CONFIG.get("smc_pivot_period", 5) or 5)
+                best = _snr_best_level(d15.tail(600), atr=atr, pp=pp, direction=int(sig), price=px, dist_atr_mult=zone_atr, max_levels=10)
+                if best is None:
+                    reasons.append("Filter: no SNR level")
                     sig = 0
-    except Exception:
-        pass
+                else:
+                    lv = best.get("level") or {}
+                    reasons.append(f"SNR {lv.get('kind')} {float(lv.get('price') or 0.0):.5f} d={float(best.get('dist') or 0.0):.5f}")
 
-    return sig, reasons, ind15, ind1h
+    reasons.append(f"TF 15m RSI:{ind15['rsi']:.0f} Trend:{'UP' if ind15['trend']==1 else 'DOWN'}")
+    reasons.append(f"Confirm 1h RSI:{ind1h['rsi']:.0f} Trend:{'UP' if ind1h['trend']==1 else 'DOWN'}")
+    reasons.append(f"Mode: {mode}")
+
+    return int(sig), reasons, ind15, ind1h
 
 
 class Account:
@@ -2039,6 +2154,8 @@ class Account:
             'entry': ind['price'],
             'sl': sl_price,
             'tp': tp_price,
+            'sl_initial': sl_price,
+            'tp_initial': tp_price,
             'lot': lot,
             'risk': risk,
             'notional': notional,
@@ -2115,26 +2232,58 @@ class Account:
             notional = float(pos.get("notional") or (float(pos.get("risk") or 0.0) * float(CONFIG.get("leverage", 1) or 1)))
             fees_close = float(notional) * float(fee_rate) if fee_rate > 0 else 0.0
 
-            raw_pnl = None
-            if pos['direction'] == 1:
-                if price >= pos['tp']:
-                    raw_pnl = float(pos['risk']) * (tp_mult / max(sl_mult, 1e-9))
-                    pos['status'] = 'WIN'
-                elif price <= pos['sl']:
-                    raw_pnl = -float(pos['risk'])
-                    pos['status'] = 'LOSS'
-            else:
-                if price <= pos['tp']:
-                    raw_pnl = float(pos['risk']) * (tp_mult / max(sl_mult, 1e-9))
-                    pos['status'] = 'WIN'
-                elif price >= pos['sl']:
-                    raw_pnl = -float(pos['risk'])
-                    pos['status'] = 'LOSS'
+            exit_reason = None
+            exit_price = None
 
-            if raw_pnl is not None:
+            if int(pos.get('direction') or 0) == 1:
+                if float(price) >= float(pos.get('tp') or 0.0):
+                    exit_reason = 'TP'
+                    exit_price = float(pos.get('tp') or price)
+                elif float(price) <= float(pos.get('sl') or 0.0):
+                    exit_reason = 'SL'
+                    exit_price = float(pos.get('sl') or price)
+            else:
+                if float(price) <= float(pos.get('tp') or 0.0):
+                    exit_reason = 'TP'
+                    exit_price = float(pos.get('tp') or price)
+                elif float(price) >= float(pos.get('sl') or 0.0):
+                    exit_reason = 'SL'
+                    exit_price = float(pos.get('sl') or price)
+
+            if exit_reason is not None and exit_price is not None:
+                entry = float(pos.get('entry') or 0.0)
+                risk = float(pos.get('risk') or 0.0)
+                sl0 = float(pos.get('sl_initial') or pos.get('sl') or entry)
+                tp0 = float(pos.get('tp_initial') or pos.get('tp') or entry)
+
+                one_r = abs(entry - sl0)
+                if one_r <= 1e-9:
+                    one_r = max(abs(entry) * 1e-6, 1e-9)
+
+                if int(pos.get('direction') or 0) == 1:
+                    rr = (float(exit_price) - entry) / one_r
+                    rr_max = (abs(tp0 - entry) / one_r) if one_r > 0 else 0.0
+                else:
+                    rr = (entry - float(exit_price)) / one_r
+                    rr_max = (abs(entry - tp0) / one_r) if one_r > 0 else 0.0
+
+                rr_max = max(rr_max, 0.0)
+                raw_pnl = float(risk) * float(rr)
+                raw_pnl = max(-float(risk), min(raw_pnl, float(risk) * float(rr_max)))
+
                 pos['fees_close'] = float(fees_close)
                 pos['pnl_raw'] = float(raw_pnl)
                 pos['pnl'] = float(raw_pnl) - float(fees_close)
+                pos['exit_reason'] = str(exit_reason)
+                pos['close_price'] = float(exit_price)
+
+                if float(pos['pnl']) > 0:
+                    pos['status'] = 'WIN'
+                elif float(pos['pnl']) < 0:
+                    pos['status'] = 'LOSS'
+                else:
+                    pos['status'] = 'FLAT'
+
                 self.balance += float(pos['pnl'])
                 closed.append(pos)
         
@@ -3147,6 +3296,111 @@ def _smc_pivots(df: pd.DataFrame, pp: int):
     return out
 
 
+def _snr_levels(df: pd.DataFrame, atr: float, pp: int, max_levels: int = 10, merge_atr_mult: float = 0.25):
+    if df is None or df.empty:
+        return []
+    atr = float(atr or 0.0)
+    pp = int(pp or 5)
+    max_levels = int(max_levels or 10)
+    merge_atr_mult = float(merge_atr_mult or 0.25)
+    if max_levels < 1:
+        return []
+
+    piv = _smc_pivots(df, pp)
+    if not piv:
+        return []
+
+    piv = piv[-48:]
+
+    levels = []
+    for p in piv:
+        price = float(p.get("price") or 0.0)
+        if price <= 0:
+            continue
+        kind = str(p.get("kind") or "")
+        is_res = (kind == "H")
+        is_sup = (kind == "L")
+
+        merged = False
+        if atr > 0 and merge_atr_mult > 0:
+            thr = atr * merge_atr_mult
+            for lv in levels:
+                if abs(price - float(lv.get("price") or 0.0)) <= thr:
+                    touches = int(lv.get("touches") or 0) + 1
+                    lv["price"] = (float(lv.get("price") or 0.0) * (touches - 1) + price) / float(touches)
+                    lv["touches"] = touches
+                    if is_res:
+                        lv["r_touches"] = int(lv.get("r_touches") or 0) + 1
+                    if is_sup:
+                        lv["s_touches"] = int(lv.get("s_touches") or 0) + 1
+                    lv["last_time"] = int(p.get("time") or lv.get("last_time") or 0)
+                    merged = True
+                    break
+
+        if not merged:
+            levels.append(
+                {
+                    "price": float(price),
+                    "touches": 1,
+                    "r_touches": 1 if is_res else 0,
+                    "s_touches": 1 if is_sup else 0,
+                    "last_time": int(p.get("time") or 0),
+                }
+            )
+
+    levels.sort(key=lambda x: (int(x.get("touches") or 0), int(x.get("last_time") or 0)), reverse=True)
+    levels = levels[:max_levels]
+
+    for lv in levels:
+        if int(lv.get("r_touches") or 0) > int(lv.get("s_touches") or 0):
+            lv["kind"] = "R"
+        elif int(lv.get("s_touches") or 0) > int(lv.get("r_touches") or 0):
+            lv["kind"] = "S"
+        else:
+            lv["kind"] = "SR"
+
+    return levels
+
+
+def _snr_best_level(df: pd.DataFrame, atr: float, pp: int, direction: int, price: float, dist_atr_mult: float, max_levels: int = 10):
+    levels = _snr_levels(df, atr=atr, pp=pp, max_levels=max_levels)
+    if not levels:
+        return None
+
+    px = float(price or 0.0)
+    a = float(atr or 0.0)
+    dist_atr_mult = float(dist_atr_mult or 0.0)
+
+    best = None
+    best_dist = None
+    for lv in levels:
+        p = float(lv.get("price") or 0.0)
+        if p <= 0:
+            continue
+        if int(direction) == 1:
+            if p > px:
+                continue
+        elif int(direction) == -1:
+            if p < px:
+                continue
+        else:
+            continue
+
+        d = abs(px - p)
+        if best is None or d < float(best_dist):
+            best = lv
+            best_dist = d
+
+    if best is None:
+        return None
+
+    if a > 0 and dist_atr_mult > 0:
+        if float(best_dist) > a * dist_atr_mult:
+            return None
+
+    return {"level": best, "dist": float(best_dist or 0.0)}
+
+
 def _smc_fvgs(df: pd.DataFrame, min_atr_mult: float = 0.2, max_n: int = 18):
     if df is None or df.empty or len(df) < 40:
         return []
@@ -3580,9 +3834,23 @@ def apply_config_patch(patch):
 
     if "signal_mode" in patch:
         mode = str(patch["signal_mode"] or "").strip().upper()
-        if mode not in ["CLASSIC", "ELLIOTT", "SMC"]:
-            raise ValueError("signal_mode must be CLASSIC, ELLIOTT or SMC")
+        if mode not in ["CLASSIC", "SMC", "HYBRID"]:
+            raise ValueError("signal_mode must be CLASSIC, SMC or HYBRID")
         out["signal_mode"] = mode
+
+    if "hybrid_require_structure" in patch:
+        out["hybrid_require_structure"] = to_bool(patch["hybrid_require_structure"])
+
+    if "hybrid_require_zone" in patch:
+        out["hybrid_require_zone"] = to_bool(patch["hybrid_require_zone"])
+
+    if "hybrid_zone_atr" in patch:
+        out["hybrid_zone_atr"] = float(patch["hybrid_zone_atr"])
+        if out["hybrid_zone_atr"] < 0 or out["hybrid_zone_atr"] > 10:
+            raise ValueError("hybrid_zone_atr must be in [0, 10]")
+
+    if "hybrid_allow_fvg" in patch:
+        out["hybrid_allow_fvg"] = to_bool(patch["hybrid_allow_fvg"])
 
     if "smc_pivot_period" in patch:
         out["smc_pivot_period"] = int(float(patch["smc_pivot_period"]))
@@ -3641,31 +3909,6 @@ def apply_config_patch(patch):
     if "goya_rank_candidates" in patch:
         out["goya_rank_candidates"] = to_bool(patch["goya_rank_candidates"])
 
-    if "deepseek_enabled" in patch:
-        out["deepseek_enabled"] = to_bool(patch["deepseek_enabled"])
-
-    if "deepseek_model" in patch:
-        out["deepseek_model"] = str(patch["deepseek_model"] or "").strip() or "deepseek-v4-flash"
-
-    if "deepseek_timeout_sec" in patch:
-        out["deepseek_timeout_sec"] = float(patch["deepseek_timeout_sec"])
-        if out["deepseek_timeout_sec"] < 1 or out["deepseek_timeout_sec"] > 60:
-            raise ValueError("deepseek_timeout_sec must be in [1, 60]")
-
-    if "deepseek_ttl_sec" in patch:
-        out["deepseek_ttl_sec"] = int(float(patch["deepseek_ttl_sec"]))
-        if out["deepseek_ttl_sec"] < 0 or out["deepseek_ttl_sec"] > 86400:
-            raise ValueError("deepseek_ttl_sec must be in [0, 86400]")
-
-    if "deepseek_min_local_score" in patch:
-        out["deepseek_min_local_score"] = int(float(patch["deepseek_min_local_score"]))
-        if out["deepseek_min_local_score"] < 0 or out["deepseek_min_local_score"] > 100:
-            raise ValueError("deepseek_min_local_score must be in [0, 100]")
-
-    if "deepseek_min_confidence" in patch:
-        out["deepseek_min_confidence"] = float(patch["deepseek_min_confidence"])
-        if out["deepseek_min_confidence"] < 0 or out["deepseek_min_confidence"] > 1:
-            raise ValueError("deepseek_min_confidence must be in [0, 1]")
 
     if "backtest_commission_bps" in patch:
         out["backtest_commission_bps"] = float(patch["backtest_commission_bps"])
@@ -4073,7 +4316,18 @@ def backtest_cmd(m):
         tr = float(CONFIG.get("trailing_stop_atr_multiplier", 1.5)) if tr_on else None
         fee = float(CONFIG.get("backtest_commission_bps", 0.0) or 0.0)
 
-    if strat in ["SMC", "OB", "FVG"]:
+    if strat in ["CLASSIC", "PROXY"]:
+        bt = backtest_classic_proxy(
+            df,
+            pair=pair,
+            sl_atr_mult=sl,
+            tp_atr_mult=tp,
+            trailing_atr_mult=tr,
+            commission_bps=fee,
+            initial_equity=float(CONFIG.get("initial_balance", 10000.0) or 10000.0),
+            risk_pct=float(CONFIG.get("risk_per_trade", 10.0) or 10.0),
+        )
+    elif strat in ["SMC", "OB", "FVG"]:
         bt = backtest_smc(
             df,
             pair=pair,
